@@ -2,7 +2,8 @@ from .Ours import DiT
 from .TimeMixer import TimeMixer
 
 _model_registry = {
-    "Ours": DiT
+    "Ours": DiT,
+    "TimeMixer": TimeMixer,
 }
 
 def get_model(name, args):
