@@ -23,8 +23,7 @@ class Exp_Long_Term_Forecast(object):
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
         
-        self.alphas = torch.arange(0.0, 1.0 + self.args.interval, self.args.interval, device=self.device)
-
+        self.alphas = torch.arange(0.0, 1.0 + self.args.interval, self.args.interval)
 
     def _acquire_device(self):
         if self.args.use_gpu:
@@ -54,21 +53,12 @@ class Exp_Long_Term_Forecast(object):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
         return model_optim
 
-    # def _select_criterion(self):
-    #     if self.args.data == 'PEMS':
-    #         criterion = nn.L1Loss()
-    #     else:
-    #         criterion = nn.MSELoss()
-    #     return criterion
-    
     def _select_criterion(self):
-        # args.loss가 있으면 반영 (기본 MSE)
-        if hasattr(self.args, "loss") and str(self.args.loss).upper() == "L1":
-            return nn.L1Loss()
-        # PEMS만 L1 쓰던 기존 규칙도 유지하고 싶으면 아래 줄 활성화:
-        if self.args.data == 'PEMS': return nn.L1Loss()
-        return nn.MSELoss()
-
+        if self.args.data == 'PEMS':
+            criterion = nn.L1Loss()
+        else:
+            criterion = nn.MSELoss()
+        return criterion
 
     def compute_ema_sequences(self, x, interval=0.01):
         batch_size, seq_len, feature_dim = x.shape
@@ -114,51 +104,19 @@ class Exp_Long_Term_Forecast(object):
         
         return batch_x, batch_y, batch_x_mark, batch_y_mark
 
-    # def sampling(self, x, x_mark, y_mark):
-    #     batch_size = x.shape[0]
-        
-    #     x = x.to(self.device)
-    #     x_mark = x_mark.to(self.device) if x_mark is not None else None
-    #     y_mark = y_mark.to(self.device) if y_mark is not None else None
-
-    #     output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
-
-    #     for alpha in self.alphas[1:]:
-    #         output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
-
-    #     return output_t  # 최종 output
-    
     def sampling(self, x, x_mark, y_mark):
-        B = x.size(0)
+        batch_size = x.shape[0]
+        
         x = x.to(self.device)
-        # 초기 예측: 마지막 관측을 pred_len만큼 반복
-        y = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)     # (B,T,C)
+        x_mark = x_mark.to(self.device) if x_mark is not None else None
+        y_mark = y_mark.to(self.device) if y_mark is not None else None
 
-        # α 큰 → 작은 순으로 진행 (강한 열화부터 되돌린다는 느낌)
-        for alpha in torch.flip(self.alphas[1:], dims=[0]):
-            a = alpha.expand(B).to(self.device)
-            # residual = fθ(current, x, α)
-            residual = self.model(y, x, a)
-            y = y + residual
-        return y
-    
-    # 복원 학습용 열화 타깃 만들기
-    def _degrade_y(self, batch_x, batch_y):
-        """
-        x_last와 y를 이어 붙여 EMA 체인을 만든 뒤, 임의의 α에서 열화된 y(z=T_α(y))를 뽑는다.
-        반환: z (B,T,C), a (B,)
-        """
-        x_last = batch_x[:, -1:].to(self.device)                       # (B,1,C)
-        seq = torch.cat([x_last, batch_y.to(self.device)], dim=1)      # (B,1+T,C)
-        ema_all, _ = self.compute_ema_sequences(seq, interval=self.args.interval)  # (B,K,1+T,C)
-        K = ema_all.size(1)
+        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
 
-        # 각 샘플마다 α를 하나씩 랜덤 샘플
-        idx = torch.randint(1, K, (seq.size(0),), device=seq.device)   # 1..K-1
-        z = ema_all[torch.arange(seq.size(0), device=seq.device), idx, 1:, :]      # (B,T,C)
-        a = self.alphas[idx].to(self.device)                           # (B,)
-        return z, a
+        for alpha in self.alphas[1:]:
+            output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
 
+        return output_t  # 최종 output
     
     
     # 이미지 저장 폴더 이름 설정
@@ -190,90 +148,103 @@ class Exp_Long_Term_Forecast(object):
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
-        vali_data,  vali_loader  = self._get_data(flag='val')
-        test_data,  test_loader  = self._get_data(flag='test')
+        vali_data, vali_loader = self._get_data(flag='val')
+        test_data, test_loader = self._get_data(flag='test')
 
         path = os.path.join(self.args.checkpoints, setting)
-        os.makedirs(path, exist_ok=True)
-
-        # 이미지 저장 경로
+        if not os.path.exists(path):
+            os.makedirs(path)
+            
+        # 이미지 저장 경로 세팅
         run_name = self._run_name(setting)
         train_fig_dir = os.path.join('./figs', run_name, 'train')
         os.makedirs(train_fig_dir, exist_ok=True)
 
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
-        model_optim = self._select_optimizer()
-        criterion  = self._select_criterion()
 
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=model_optim,
-            steps_per_epoch=train_steps,
-            pct_start=self.args.pct_start,
-            epochs=self.args.train_epochs,
-            max_lr=self.args.learning_rate,
-        )
+        model_optim = self._select_optimizer()
+        criterion = self._select_criterion()
+
+        scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
+                                            steps_per_epoch=train_steps,
+                                            pct_start=self.args.pct_start,
+                                            epochs=self.args.train_epochs,
+                                            max_lr=self.args.learning_rate)
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
             pbar = tqdm(enumerate(train_loader), total=len(train_loader))
+            
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
                 model_optim.zero_grad()
 
-                # device 올리기
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch(
-                    batch_x, batch_y, batch_x_mark, batch_y_mark
-                )
+                # 수정된 부분: 간단한 전처리
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
+                
+                # 최종 예측
+                output = self.sampling(batch_x, batch_x_mark, batch_y_mark)
 
-                # === 한 스텝 복원 학습: z = T_α(y), pred = z + fθ(z, x, α) ===
-                z, a = self._degrade_y(batch_x, batch_y)
-                residual = self.model(z, batch_x, a)
-                pred = z + residual
+                # 변경된 부분: loss는 최종 예측과 ground truth 간 비교
+                loss = criterion(output, batch_y)
 
-                loss = criterion(pred, batch_y)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)  # 안정화
                 model_optim.step()
-                scheduler.step()  # ★ 배치마다!
-
-                # (선택) LR 로깅
-                # wandb.log({"lr": scheduler.get_last_lr()[0]})
-
-                # 100 스텝마다 그림 저장
+                
+                if self.args.lradj == 'TST':
+                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
+                    scheduler.step()
+                    
+                # === 시각화: 100 스텝마다 1개 샘플 저장 ===
                 if i % 100 == 0:
                     with torch.no_grad():
+                        # CPU로 옮기기
                         x_np = batch_x.detach().cpu().numpy()
                         y_np = batch_y.detach().cpu().numpy()
-                        p_np = pred.detach().cpu().numpy()
+                        o_np = output.detach().cpu().numpy()
 
+                        # (옵션) 역변환: ETT류는 inverse=False면 그대로 둠
                         if train_data.scale and self.args.inverse:
                             shape = x_np.shape
                             x_np = train_data.inverse_transform(x_np.squeeze(0)).reshape(shape)
 
+                        # 첫 배치 첫 채널 예시 그대로 사용
                         gt = np.concatenate((x_np[0, :, -1], y_np[0, :, -1]), axis=0)
-                        pd = np.concatenate((x_np[0, :, -1], p_np[0, :, -1]), axis=0)
-                        visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{epoch:03d}-iter_{i:05d}.pdf"))
+                        pd = np.concatenate((x_np[0, :, -1], o_np[0, :, -1]), axis=0)
+
+                        if epoch is not None:
+                            visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{str(epoch)}-{str(i)}.pdf"))
+                        else:
+                            visual(gt, pd, os.path.join(train_fig_dir, f"{str(i)}.pdf"))
 
                 wandb.log({"epoch": epoch, "iteration": i, "train/loss": loss})
                 pbar.set_postfix(loss=loss.item())
 
-            # === 검증은 최종 파이프라인(sampling)으로 평가 ===
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
             self.test(setting, test=False, epoch=epoch)
 
-            wandb.log({"epoch": epoch, "val/loss": vali_loss, "test/loss": test_loss})
-            print(f"Epoch: {epoch+1} | Vali Loss: {vali_loss:.7f} Test Loss: {test_loss:.7f}")
+            wandb.log({
+                "epoch": epoch,
+                "val/loss": vali_loss,
+                "test/loss": test_loss,
+            })
 
+            print("Epoch: {} | Vali Loss: {:.7f} Test Loss: {:.7f}".format(epoch + 1, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
-        best_model_path = os.path.join(path, 'checkpoint.pth')
-        self.model.load_state_dict(torch.load(best_model_path))
-        return self.model
+            if self.args.lradj != 'TST':
+                adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=True)
+            else:
+                print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
+        best_model_path = path + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path))
+
+        return self.model
 
     def test(self, setting, test, epoch=None):
         test_data, test_loader = self._get_data(flag='test')
