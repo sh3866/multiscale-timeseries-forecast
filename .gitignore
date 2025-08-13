@@ -1,0 +1,12 @@
+.DS_store
+.python-version
+*.pth
+result_*.txt
+__MACOSX/
+
+__pycache__/
+dataset/
+results/
+figs/
+wandb/
+exp_original/
