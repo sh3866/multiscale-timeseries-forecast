@@ -81,19 +81,23 @@ class Exp_Long_Term_Forecast(object):
         return ema_outputs, alpha_values
 
     def process_batch(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
+        _, seq_len, feature_dim = batch_x.shape
+        
         batch_x, batch_y, batch_x_mark, batch_y_mark = batch_x.float(), batch_y.float(), batch_x_mark.float(), batch_y_mark.float()
 
         if 'PEMS' == self.args.data or 'Solar' == self.args.data:
             batch_x_mark = None
             batch_y_mark = None
-
-        batch_x = batch_x.to(self.device)
-        batch_y = batch_y.to(self.device)
-        batch_x_mark = batch_x_mark.to(self.device) if batch_x_mark is not None else None
-        batch_y_mark = batch_y_mark.to(self.device) if batch_y_mark is not None else None
-
-        return batch_x, batch_y, batch_x_mark, batch_y_mark
-
+        
+        batch_ema_y, alpha_values = self.compute_ema_sequences(torch.cat([batch_x[:, -1].unsqueeze(1), batch_y], dim=1), interval=self.args.interval)
+        batch_ema_y = batch_ema_y[:, :, 1:]
+        
+        batch_x = batch_x.unsqueeze(1).expand(-1, int(1 / self.args.interval), -1, -1).contiguous().view(-1, seq_len, feature_dim).to(self.device)
+        batch_ema_y_prev = batch_ema_y[:, 1:].contiguous().view(-1, seq_len, feature_dim).to(self.device)
+        batch_ema_y_target = batch_ema_y[:, :-1].contiguous().view(-1, seq_len, feature_dim).to(self.device)
+        alpha_values = alpha_values[:, 1:].contiguous().view(-1).to(self.device)
+        
+        return batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values
 
     def process_batch_for_test(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
         batch_x, batch_y, batch_x_mark, batch_y_mark = batch_x.float(), batch_y.float(), batch_x_mark.float(), batch_y_mark.float()
@@ -108,16 +112,15 @@ class Exp_Long_Term_Forecast(object):
         batch_size = x.shape[0]
         
         x = x.to(self.device)
-        x_mark = x_mark.to(self.device) if x_mark is not None else None
-        y_mark = y_mark.to(self.device) if y_mark is not None else None
-
+        x_mark = x_mark.to(self.device)
+        y_mark = y_mark.to(self.device)
+        
         output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
 
-        for alpha in self.alphas[1:]:
+        for alpha in torch.flip(self.alphas[1:], dims=[0]):
             output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
-
-        return output_t  # 최종 output
-    
+        
+        return output_t
     
     # 이미지 저장 폴더 이름 설정
     def _run_name(self, fallback: str) -> str:
@@ -128,17 +131,17 @@ class Exp_Long_Term_Forecast(object):
             pass
         return fallback
 
-
-
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
             pbar = tqdm(enumerate(vali_loader), total=len(vali_loader))
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
-                output = self.sampling(batch_x, batch_x_mark, batch_y_mark)
-                loss = criterion(output, batch_y)
+                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
+                
+                outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
+
+                loss = criterion(outputs, batch_ema_y_target)
                 total_loss.append(loss.item())
                 pbar.set_postfix(loss=loss.item())
 
@@ -174,23 +177,21 @@ class Exp_Long_Term_Forecast(object):
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
+
             pbar = tqdm(enumerate(train_loader), total=len(train_loader))
             
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
                 model_optim.zero_grad()
-
-                # 수정된 부분: 간단한 전처리
-                batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
                 
-                # 최종 예측
-                output = self.sampling(batch_x, batch_x_mark, batch_y_mark)
-
-                # 변경된 부분: loss는 최종 예측과 ground truth 간 비교
-                loss = criterion(output, batch_y)
+                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
+                
+                outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
+                
+                loss = criterion(outputs, batch_ema_y_target)
 
                 loss.backward()
                 model_optim.step()
-                
+
                 if self.args.lradj == 'TST':
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
@@ -198,17 +199,15 @@ class Exp_Long_Term_Forecast(object):
                 # === 시각화: 100 스텝마다 1개 샘플 저장 ===
                 if i % 100 == 0:
                     with torch.no_grad():
-                        # CPU로 옮기기
+                        
                         x_np = batch_x.detach().cpu().numpy()
                         y_np = batch_y.detach().cpu().numpy()
-                        o_np = output.detach().cpu().numpy()
+                        o_np = outputs.detach().cpu().numpy()
 
-                        # (옵션) 역변환: ETT류는 inverse=False면 그대로 둠
                         if train_data.scale and self.args.inverse:
                             shape = x_np.shape
                             x_np = train_data.inverse_transform(x_np.squeeze(0)).reshape(shape)
 
-                        # 첫 배치 첫 채널 예시 그대로 사용
                         gt = np.concatenate((x_np[0, :, -1], y_np[0, :, -1]), axis=0)
                         pd = np.concatenate((x_np[0, :, -1], o_np[0, :, -1]), axis=0)
 
@@ -216,6 +215,7 @@ class Exp_Long_Term_Forecast(object):
                             visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{str(epoch)}-{str(i)}.pdf"))
                         else:
                             visual(gt, pd, os.path.join(train_fig_dir, f"{str(i)}.pdf"))
+
 
                 wandb.log({"epoch": epoch, "iteration": i, "train/loss": loss})
                 pbar.set_postfix(loss=loss.item())
@@ -254,7 +254,6 @@ class Exp_Long_Term_Forecast(object):
 
         preds = []
         trues = []
-        
         
         run_name = self._run_name(setting)
         test_fig_dr = os.path.join('./figs', run_name, 'test')
