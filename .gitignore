@@ -1,12 +1,85 @@
+# macOS
+.DS_Store
 .DS_store
-.python-version
-*.pth
-result_*.txt
 __MACOSX/
 
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.python-version
+
+# Virtual environments
+venv/
+venv_*/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data and results
 dataset/
+datasets/
+data/
 results/
+result_*.txt
 figs/
+figures/
+logs/
+log/
+
+# Experiment tracking
 wandb/
+mlruns/
+tensorboard/
+tb_logs/
+
+# Model checkpoints and outputs
+checkpoints/
+checkpoints_*/
+models/
+saved_models/
+outputs/
 exp_original/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
