@@ -12,7 +12,7 @@ train_epochs=100
 
 ### Model description
 model_name=Ours
-interval=0.01
+interval=0.1
 hidden_dim=32
 num_heads=4
 num_dit_block=4
@@ -33,6 +33,7 @@ python -u run.py \
   --feature_dim $feature_dim \
   --batch_size $batch_size \
   --learning_rate $learning_rate \
+  --interval $interval \
   --hidden_dim $hidden_dim \
   --num_heads $num_heads \
   --num_dit_block $num_dit_block
