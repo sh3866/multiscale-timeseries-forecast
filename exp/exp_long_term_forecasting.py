@@ -60,7 +60,7 @@ class Exp_Long_Term_Forecast(object):
             criterion = nn.MSELoss()
         return criterion
 
-    def compute_ema_sequences(self, x, interval=0.01):
+    def compute_ema_sequences(self, x, interval=0.1):
         batch_size, seq_len, feature_dim = x.shape
         
         ema_outputs = torch.zeros((batch_size, len(self.alphas), seq_len, feature_dim), dtype=x.dtype, device=x.device)
@@ -82,6 +82,7 @@ class Exp_Long_Term_Forecast(object):
 
     def process_batch(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
         _, seq_len, feature_dim = batch_x.shape
+        T_pred = batch_y.shape[1]
         
         batch_x, batch_y, batch_x_mark, batch_y_mark = batch_x.float(), batch_y.float(), batch_x_mark.float(), batch_y_mark.float()
 
@@ -93,8 +94,8 @@ class Exp_Long_Term_Forecast(object):
         batch_ema_y = batch_ema_y[:, :, 1:]
         
         batch_x = batch_x.unsqueeze(1).expand(-1, int(1 / self.args.interval), -1, -1).contiguous().view(-1, seq_len, feature_dim).to(self.device)
-        batch_ema_y_prev = batch_ema_y[:, 1:].contiguous().view(-1, seq_len, feature_dim).to(self.device)
-        batch_ema_y_target = batch_ema_y[:, :-1].contiguous().view(-1, seq_len, feature_dim).to(self.device)
+        batch_ema_y_prev = batch_ema_y[:, 1:].contiguous().view(-1, T_pred, feature_dim).to(self.device)
+        batch_ema_y_target = batch_ema_y[:, :-1].contiguous().view(-1, T_pred, feature_dim).to(self.device)
         alpha_values = alpha_values[:, 1:].contiguous().view(-1).to(self.device)
         
         return batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values
@@ -196,25 +197,33 @@ class Exp_Long_Term_Forecast(object):
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
                     
-                # === 시각화: 100 스텝마다 1개 샘플 저장 ===
+                # === 시각화: 100 스텝마다 1개 샘플 저장 + Metric 계산 ===
                 if i % 100 == 0:
                     with torch.no_grad():
-                        
-                        x_np = batch_x.detach().cpu().numpy()
-                        y_np = batch_y.detach().cpu().numpy()
-                        o_np = outputs.detach().cpu().numpy()
+                        # sampling을 이용해 원본 future 예측
+                        pred_y = self.sampling(batch_x[:1], batch_x_mark[:1], batch_y_mark[:1])
+                        true_y = batch_y[:1]
 
+                        # numpy 변환
+                        pred_np = pred_y.detach().cpu().numpy()
+                        true_np = true_y.detach().cpu().numpy()
+                        x_np = batch_x[:1].detach().cpu().numpy()
+
+                        # 필요하면 inverse_transform 적용 (데이터셋에 따라)
                         if train_data.scale and self.args.inverse:
-                            shape = x_np.shape
-                            x_np = train_data.inverse_transform(x_np.squeeze(0)).reshape(shape)
+                            pred_np = train_data.inverse_transform(pred_np.reshape(-1, pred_np.shape[-1])).reshape(pred_np.shape)
+                            true_np = train_data.inverse_transform(true_np.reshape(-1, true_np.shape[-1])).reshape(true_np.shape)
+                            x_np = train_data.inverse_transform(x_np.reshape(-1, x_np.shape[-1])).reshape(x_np.shape)
 
-                        gt = np.concatenate((x_np[0, :, -1], y_np[0, :, -1]), axis=0)
-                        pd = np.concatenate((x_np[0, :, -1], o_np[0, :, -1]), axis=0)
+                        # (과거 구간 + 미래 구간)으로 concat 해서 그림 그리기
+                        gt = np.concatenate((x_np[0, :, -1], true_np[0, :, -1]), axis=0)
+                        pd = np.concatenate((x_np[0, :, -1], pred_np[0, :, -1]), axis=0)
 
+                        # 그림 저장
                         if epoch is not None:
-                            visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{str(epoch)}-{str(i)}.pdf"))
+                            visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{epoch}-{i}.pdf"))
                         else:
-                            visual(gt, pd, os.path.join(train_fig_dir, f"{str(i)}.pdf"))
+                            visual(gt, pd, os.path.join(train_fig_dir, f"{i}.pdf"))
 
 
                 wandb.log({"epoch": epoch, "iteration": i, "train/loss": loss})
