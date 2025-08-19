@@ -60,7 +60,7 @@ class Exp_Long_Term_Forecast(object):
             criterion = nn.MSELoss()
         return criterion
 
-    def compute_ema_sequences(self, x, interval=0.1):
+    def compute_ema_sequences(self, x, interval):
         batch_size, seq_len, feature_dim = x.shape
         
         ema_outputs = torch.zeros((batch_size, len(self.alphas), seq_len, feature_dim), dtype=x.dtype, device=x.device)
@@ -214,6 +214,16 @@ class Exp_Long_Term_Forecast(object):
                             pred_np = train_data.inverse_transform(pred_np.reshape(-1, pred_np.shape[-1])).reshape(pred_np.shape)
                             true_np = train_data.inverse_transform(true_np.reshape(-1, true_np.shape[-1])).reshape(true_np.shape)
                             x_np = train_data.inverse_transform(x_np.reshape(-1, x_np.shape[-1])).reshape(x_np.shape)
+                            
+                        mse = np.mean((pred_np - true_np) ** 2)
+                        mae = np.mean(np.abs(pred_np - true_np))
+                        
+                        wandb.log({
+                            "epoch": epoch,
+                            "iteration": i,
+                            "train/sampling_mse": mse,
+                            "train/sampling_mae": mae,
+                        })
 
                         # (과거 구간 + 미래 구간)으로 concat 해서 그림 그리기
                         gt = np.concatenate((x_np[0, :, -1], true_np[0, :, -1]), axis=0)
