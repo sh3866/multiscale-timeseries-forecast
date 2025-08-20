@@ -114,8 +114,8 @@ class Global_Loss(object):
         batch_size = x.shape[0]
         
         x = x.to(self.device)
-        x_mark = x_mark.to(self.device)
-        y_mark = y_mark.to(self.device)
+        x_mark = x_mark.to(self.device) if x_mark is not None else None
+        y_mark = y_mark.to(self.device) if y_mark is not None else None
         
         output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
 
@@ -124,12 +124,30 @@ class Global_Loss(object):
         
         return output_t
     
+    # differentiable sampling that returns all intermediate predictions as a tensor
+    def sampling_with_intermediates_tensor(self, x, x_mark, y_mark):
+        batch_size = x.shape[0]
+        
+        x = x.to(self.device)
+        x_mark = x_mark.to(self.device) if x_mark is not None else None
+        y_mark = y_mark.to(self.device) if y_mark is not None else None
+
+        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
+        preds = []  # list of tensors, one per alpha step (reverse order)
+
+        for alpha in torch.flip(self.alphas[1:], dims=[0]):
+            output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
+            preds.append(output_t)
+
+        # stack along step dimension: (B, num_steps=A-1, T_pred, C)
+        return torch.stack(preds, dim=1)
+    
     # sampling for training
     def sampling_with_intermediates(self, x, x_mark, y_mark):
         batch_size = x.shape[0]
         x = x.to(self.device)
-        x_mark = x_mark.to(self.device)
-        y_mark = y_mark.to(self.device)
+        x_mark = x_mark.to(self.device) if x_mark is not None else None
+        y_mark = y_mark.to(self.device) if y_mark is not None else None
 
         output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
         preds = []  # α step별 결과 기록
@@ -168,14 +186,25 @@ class Global_Loss(object):
                 step_loss = criterion(step_outputs, batch_ema_y_target)
                 step_losses.append(step_loss.item())
                 
-                # === global loss ===
-                t_pred = self.sampling(
-                    batch_x_raw.float().to(self.device),
-                    batch_x_mark_raw.float().to(self.device) if batch_x_mark_raw is not None else None,
-                    batch_y_mark_raw.float().to(self.device) if batch_y_mark_raw is not None else None,
-                )
-                t_true = batch_y.float().to(self.device)
-                global_loss = criterion(t_pred, t_true)
+                # === global loss (final + intermediate EMA supervision) ===
+                preds_all = self.sampling_with_intermediates_tensor(
+                    batch_x_raw.float(),
+                    batch_x_mark_raw.float() if batch_x_mark_raw is not None else None,
+                    batch_y_mark_raw.float() if batch_y_mark_raw is not None else None,
+                )  # (B, A-1, T_pred, C)
+
+                ema_full, _ = self.compute_ema_sequences(
+                    torch.cat([batch_x_raw.float()[:, -1].unsqueeze(1), batch_y.float()], dim=1),
+                    interval=self.args.interval,
+                )  # (B, A, T_pred+1, C)
+                ema_full = ema_full[:, :, 1:]  # (B, A, T_pred, C)
+                targets_all = torch.flip(ema_full, dims=[1])[:, 1:, :, :].to(self.device)  # (B, A-1, T_pred, C), [0.95..0.0]
+
+                w_final = getattr(self.args, 'global_final_weight', 1.0)
+                w_inter = getattr(self.args, 'global_intermediate_weight', 1.0)
+                global_loss_final = criterion(preds_all[:, -1, :, :], batch_y.float().to(self.device))
+                global_loss_intermediate = criterion(preds_all, targets_all)
+                global_loss = w_final * global_loss_final + w_inter * global_loss_intermediate
                 global_losses.append(global_loss.item())
                 
                 # === tqdm 진행바에 step+global 동시 표시 ===
@@ -232,13 +261,30 @@ class Global_Loss(object):
                 
                 step_loss = criterion(step_outputs, batch_ema_y_target)
                 
-                # === global loss ===
-                t_pred_y = self.sampling(batch_x_raw.float().to(self.device), batch_x_mark_raw.float().to(self.device), batch_y_mark_raw.float().to(self.device))
+                # === global loss (final + intermediate EMA supervision) ===
+                # 1) differentiable intermediate predictions
+                preds_all = self.sampling_with_intermediates_tensor(
+                    batch_x_raw.float(),
+                    batch_x_mark_raw.float() if batch_x_mark_raw is not None else None,
+                    batch_y_mark_raw.float() if batch_y_mark_raw is not None else None,
+                )  # (B, A-1, T_pred, C)
+
+                # 2) build EMA targets for all alpha steps (reverse order)
+                ema_full, _ = self.compute_ema_sequences(
+                    torch.cat([batch_x_raw.float()[:, -1].unsqueeze(1), batch_y.float()], dim=1),
+                    interval=self.args.interval,
+                )  # (B, A, T_pred+1, C)
+                ema_full = ema_full[:, :, 1:]  # drop t=0 to keep only future horizon: (B, A, T_pred, C)
+                targets_all = torch.flip(ema_full[:, 1:, :, :].to(self.device), dims=[1])  # align with [1.0, ..., interval]
+
+                # 3) final y_true term + intermediate EMA term
                 t_true_y = batch_y.float().to(self.device)
+                t_pred_final = preds_all[:, -1, :, :]
+                global_loss_final = criterion(t_pred_final, t_true_y)
+                global_loss_intermediate = criterion(preds_all, targets_all)
+                global_loss = global_loss_final + global_loss_intermediate
                 
-                global_loss = criterion(t_pred_y, t_true_y)
-                
-                loss = step_loss + global_loss
+                loss = global_loss + step_loss
 
                 loss.backward()
                 model_optim.step()
