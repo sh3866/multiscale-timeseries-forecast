@@ -18,7 +18,7 @@ from models import get_model
 warnings.filterwarnings('ignore')
 
 
-class Exp_Long_Term_Forecast(object):
+class Global_Loss(object):
     def __init__(self, args):
         self.args = args
         self.device = self._acquire_device()
@@ -151,22 +151,45 @@ class Exp_Long_Term_Forecast(object):
         return fallback
 
     def vali(self, vali_data, vali_loader, criterion):
-        total_loss = []
+        
+        step_losses = []
+        global_losses = []
+        
         self.model.eval()
         with torch.no_grad():
             pbar = tqdm(enumerate(vali_loader), total=len(vali_loader))
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
-                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
+            for i, (batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw) in pbar:
                 
-                outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
+                # === step loss ===
+                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw)
+                
+                step_outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
 
-                loss = criterion(outputs, batch_ema_y_target)
-                total_loss.append(loss.item())
-                pbar.set_postfix(loss=loss.item())
+                step_loss = criterion(step_outputs, batch_ema_y_target)
+                step_losses.append(step_loss.item())
+                
+                # === global loss ===
+                t_pred = self.sampling(
+                    batch_x_raw.float().to(self.device),
+                    batch_x_mark_raw.float().to(self.device) if batch_x_mark_raw is not None else None,
+                    batch_y_mark_raw.float().to(self.device) if batch_y_mark_raw is not None else None,
+                )
+                t_true = batch_y.float().to(self.device)
+                global_loss = criterion(t_pred, t_true)
+                global_losses.append(global_loss.item())
+                
+                # === tqdm 진행바에 step+global 동시 표시 ===
+                pbar.set_postfix(
+                    step_loss=step_loss.item(),
+                    global_loss=global_loss.item()
+                )
+        
+        step_loss_avg = np.mean(step_losses)
+        global_loss_avg = np.mean(global_losses)
+        total_loss_avg = step_loss_avg + global_loss_avg
 
-        total_loss = np.average(total_loss)
         self.model.train()
-        return total_loss
+        return step_loss_avg, global_loss_avg, total_loss_avg
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -188,32 +211,41 @@ class Exp_Long_Term_Forecast(object):
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
-                                            steps_per_epoch=train_steps,
-                                            pct_start=self.args.pct_start,
-                                            epochs=self.args.train_epochs,
-                                            max_lr=self.args.learning_rate)
+        # scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
+        #                                     steps_per_epoch=train_steps,
+        #                                     pct_start=self.args.pct_start,
+        #                                     epochs=self.args.train_epochs,
+        #                                     max_lr=self.args.learning_rate)
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
 
             pbar = tqdm(enumerate(train_loader), total=len(train_loader))
             
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
+            for i, (batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw) in pbar:
                 model_optim.zero_grad()
                 
-                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x, batch_y, batch_x_mark, batch_y_mark)
+                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw)
                 
-                outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
+                # === 한 step loss ===
+                step_outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
                 
-                loss = criterion(outputs, batch_ema_y_target)
+                step_loss = criterion(step_outputs, batch_ema_y_target)
+                
+                # === global loss ===
+                t_pred_y = self.sampling(batch_x_raw.float().to(self.device), batch_x_mark_raw.float().to(self.device), batch_y_mark_raw.float().to(self.device))
+                t_true_y = batch_y.float().to(self.device)
+                
+                global_loss = criterion(t_pred_y, t_true_y)
+                
+                loss = step_loss + global_loss
 
                 loss.backward()
                 model_optim.step()
 
-                if self.args.lradj == 'TST':
-                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
-                    scheduler.step()
+                # if self.args.lradj == 'TST':
+                    # adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
+                    # scheduler.step()
                     
                 # === 시각화: 100 스텝마다 1개 샘플 저장 + Metric 계산 ===
                 if i % 100 == 0:
@@ -300,29 +332,38 @@ class Exp_Long_Term_Forecast(object):
                         # ============================================================================
 
 
-                wandb.log({"epoch": epoch, "iteration": i, "train/loss": loss})
+                wandb.log({
+                    "epoch": epoch,
+                    "iteration": i,
+                    "train/step_loss": step_loss.item(),
+                    "train/global_loss": global_loss.item(),
+                    "train/total_loss": loss.item()
+                })
+
                 pbar.set_postfix(loss=loss.item())
 
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            vali_step_loss, vali_global_loss, vali_total_loss = self.vali(vali_data, vali_loader, criterion)
+            test_step_loss, test_global_loss, test_total_loss = self.vali(test_data, test_loader, criterion)
             self.test(setting, test=False, epoch=epoch)
 
             wandb.log({
                 "epoch": epoch,
-                "val/loss": vali_loss,
-                "test/loss": test_loss,
+                "val/loss": vali_total_loss,
+                "test/loss": test_total_loss,
+                "test/step_loss": test_step_loss,
+                "test/global_loss": test_global_loss,
             })
 
-            print("Epoch: {} | Vali Loss: {:.7f} Test Loss: {:.7f}".format(epoch + 1, vali_loss, test_loss))
-            early_stopping(vali_loss, self.model, path)
+            print("Epoch: {} | Vali Loss: {:.7f} Test Loss: {:.7f}".format(epoch + 1, vali_total_loss, test_total_loss))
+            early_stopping(vali_total_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
-            if self.args.lradj != 'TST':
-                adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=True)
-            else:
-                print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
+            # if self.args.lradj != 'TST':
+            #     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=True)
+            # else:
+            #     print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
         best_model_path = path + '/' + 'checkpoint.pth'
         self.model.load_state_dict(torch.load(best_model_path))
