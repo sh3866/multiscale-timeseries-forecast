@@ -228,14 +228,14 @@ class DiT(nn.Module):
         y: (N,) tensor of class labels
         """
         
-        y_raw = y
+        y_copy = y.clone()
+
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D)
         y = self.y_embedder(y) + self.pos_embed  # (N, T, D)
         t = self.t_embedder(t)
         for block in self.blocks:
             x = block(x, y, t)
         x = self.final_layer(x, t)
-        
-        out = x + y_raw
-        
-        return out
+
+        return x + y_copy
+
