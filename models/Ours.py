@@ -227,10 +227,11 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        y_copy = y.clone()
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D)
         y = self.y_embedder(y) + self.pos_embed  # (N, T, D)
         t = self.t_embedder(t)
         for block in self.blocks:
             x = block(x, y, t)
         x = self.final_layer(x, t)
-        return x
+        return x + y_copy
