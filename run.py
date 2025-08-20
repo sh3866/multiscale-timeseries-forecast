@@ -6,6 +6,7 @@ import torch
 import wandb
 
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
+from exp.global_loss import Global_Loss
 
 
 def set_seed(seed):
@@ -101,7 +102,8 @@ if __name__ == '__main__':
     print(args)
     
     tasks = {
-        'long_term_forecast': Exp_Long_Term_Forecast
+        'long_term_forecast': Exp_Long_Term_Forecast,
+        'global_loss': Global_Loss
     }
     exp = tasks[args.task_name](args)
 

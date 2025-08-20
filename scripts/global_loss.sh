@@ -12,13 +12,13 @@ train_epochs=20
 
 ### Model description
 model_name=Ours
-interval=0.1
+interval=0.05
 hidden_dim=32
 num_heads=4
 num_dit_block=4
 
 python -u run.py \
-  --task_name long_term_forecast_test \
+  --task_name global_loss \
   --is_training 1 \
   --root_path  ./dataset/ETT-small/\
   --data_path ETTm1.csv \
