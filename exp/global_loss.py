@@ -284,7 +284,7 @@ class Global_Loss(object):
                 global_loss_intermediate = criterion(preds_all, targets_all)
                 global_loss = global_loss_final + global_loss_intermediate
                 
-                loss = global_loss #+ step_loss
+                loss = global_loss + step_loss
 
                 loss.backward()
                 model_optim.step()
