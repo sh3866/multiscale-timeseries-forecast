@@ -5,13 +5,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
-from torch.optim import lr_scheduler
 from tqdm import tqdm
 import wandb
 import matplotlib.pyplot as plt
 
 from data_provider.data_factory import data_provider
-from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.tools import EarlyStopping, visual
 from utils.metrics import metric
 from models import get_model
 
@@ -23,18 +22,31 @@ class Global_Loss(object):
         self.args = args
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
-        
-        self.alphas = torch.arange(0.0, 1.0 + self.args.interval, self.args.interval)
+
+        # ==== α 그리드 안정화: linspace로 고정 개수 생성 ====
+        steps = int(round(1.0 / self.args.interval))
+        steps = max(1, steps)
+        self.alphas = torch.linspace(0.0, 1.0, steps + 1, dtype=torch.float32)  # [0, ..., 1], 길이 A=steps+1
+        self.num_steps = steps  # 스텝 수 K = A-1
+
+        # AMP/Grad-clip
+        self.use_amp = getattr(self.args, "use_amp", False)
+        self.max_grad_norm = getattr(self.args, "max_grad_norm", 1.0)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+
+        # 시각화 빈도 제어
+        self.plot_every = getattr(self.args, "plot_every", 10)
 
     def _acquire_device(self):
         if self.args.use_gpu:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(
-                self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
-            device = torch.device('cuda:{}'.format(self.args.gpu))
             if self.args.use_multi_gpu:
-                print('Use GPU: cuda{}'.format(self.args.device_ids))
+                os.environ["CUDA_VISIBLE_DEVICES"] = self.args.devices.replace(' ', '')
+                device = torch.device(f'cuda:{self.args.gpu}')
+                print(f'Use Multi-GPU: {self.args.devices} (primary cuda:{self.args.gpu})')
             else:
-                print('Use GPU: cuda:{}'.format(self.args.gpu))
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(self.args.gpu)
+                device = torch.device(f'cuda:{self.args.gpu}')
+                print(f'Use GPU: cuda:{self.args.gpu}')
         else:
             device = torch.device('cpu')
             print('Use CPU')
@@ -51,115 +63,119 @@ class Global_Loss(object):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        return model_optim
+        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
-        if self.args.data == 'PEMS':
-            criterion = nn.L1Loss()
-        else:
-            criterion = nn.MSELoss()
-        return criterion
+        # 데이터셋 명시보다 loss 플래그를 신뢰
+        name = getattr(self.args, "loss", "MSE").upper()
+        if name in ("L1", "MAE"):
+            return nn.L1Loss()
+        if name in ("HUBER", "SMOOTH_L1"):
+            beta = getattr(self.args, "huber_beta", 1.0)
+            return nn.SmoothL1Loss(beta=beta)
+        return nn.MSELoss()
 
-    def compute_ema_sequences(self, x, interval):
-        batch_size, seq_len, feature_dim = x.shape
-        
-        ema_outputs = torch.zeros((batch_size, len(self.alphas), seq_len, feature_dim), dtype=x.dtype, device=x.device)
+    # ==== α 역순 진행 헬퍼: 큰 α → 작은 α ====
+    def _alpha_steps_desc(self):
+        # α=0은 원시 타깃 쪽 끝. 복원 스케줄은 [1-Δ, ..., Δ] 사용
+        return torch.flip(self.alphas[1:], dims=[0])  # 길이 K = A-1
 
-        for i, alpha in enumerate(self.alphas):
-            ema = x[:, 0, :]  # (batch, feature_dim), init with first x_t
-            ema_seq = [ema.unsqueeze(1)]  # time t=0
+    # ==== EMA 계산: α 축 브로드캐스트, 시간 루프만 ====
+    def compute_ema_sequences(self, x):
+        """
+        x: (B, T, C), T에는 과거 마지막값 + 예측구간이 들어올 수 있음
+        return:
+          ema_outputs: (B, A, T, C)  where A = len(self.alphas)
+          alpha_values: (B, A)
+        """
+        B, T, C = x.shape
+        alphas = self.alphas.to(x.device)  # (A,)
+        A = alphas.numel()
 
-            for t in range(1, seq_len):
-                ema = alpha * ema + (1 - alpha) * x[:, t, :]
-                ema_seq.append(ema.unsqueeze(1))
+        ema = x[:, 0, :].unsqueeze(1).expand(B, A, C).contiguous()  # (B,A,C)
+        outs = [ema.unsqueeze(2)]  # (B,A,1,C)
 
-            ema_seq = torch.cat(ema_seq, dim=1)  # (batch, seq_len, feature_dim)
-            ema_outputs[:, i, :, :] = ema_seq
-        
-        alpha_values = self.alphas.unsqueeze(0).expand(batch_size, -1)
-        
+        a = alphas.view(1, A, 1)               # (1,A,1)
+        one_minus_a = (1 - alphas).view(1, A, 1)
+
+        for t in range(1, T):
+            xt = x[:, t, :].unsqueeze(1)      # (B,1,C)
+            ema = a * ema + one_minus_a * xt  # (B,A,C)
+            outs.append(ema.unsqueeze(2))     # (B,A,1,C)
+
+        ema_outputs = torch.cat(outs, dim=2)  # (B,A,T,C)
+        alpha_values = alphas.unsqueeze(0).expand(B, A)  # (B,A)
         return ema_outputs, alpha_values
 
+    # ==== 학습·검증 공용: 스텝 지도 데이터 구성 ====
     def process_batch(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
+        """
+        EMA(y)에서 y_{alpha_k} -> y_{alpha_{k-1}} 지도 학습용 쌍을 구성.
+        """
         _, seq_len, feature_dim = batch_x.shape
         T_pred = batch_y.shape[1]
-        
-        batch_x, batch_y, batch_x_mark, batch_y_mark = batch_x.float(), batch_y.float(), batch_x_mark.float(), batch_y_mark.float()
 
-        if 'PEMS' == self.args.data or 'Solar' == self.args.data:
-            batch_x_mark = None
-            batch_y_mark = None
-        
-        batch_ema_y, alpha_values = self.compute_ema_sequences(torch.cat([batch_x[:, -1].unsqueeze(1), batch_y], dim=1), interval=self.args.interval)
-        batch_ema_y = batch_ema_y[:, :, 1:]
-        
-        batch_x = batch_x.unsqueeze(1).expand(-1, int(1 / self.args.interval), -1, -1).contiguous().view(-1, seq_len, feature_dim).to(self.device)
-        batch_ema_y_prev = batch_ema_y[:, 1:].contiguous().view(-1, T_pred, feature_dim).to(self.device)
-        batch_ema_y_target = batch_ema_y[:, :-1].contiguous().view(-1, T_pred, feature_dim).to(self.device)
-        alpha_values = alpha_values[:, 1:].contiguous().view(-1).to(self.device)
-        
-        return batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values
+        batch_x = batch_x.float()
+        batch_y = batch_y.float()
+        batch_x_mark = None if self.args.data in ('PEMS', 'Solar') else (batch_x_mark.float() if batch_x_mark is not None else None)
+        batch_y_mark = None if self.args.data in ('PEMS', 'Solar') else (batch_y_mark.float() if batch_y_mark is not None else None)
 
-    def process_batch_for_test(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
-        batch_x, batch_y, batch_x_mark, batch_y_mark = batch_x.float(), batch_y.float(), batch_x_mark.float(), batch_y_mark.float()
+        # 과거 마지막 값 + 미래구간 전체에 대해 EMA
+        ema_all, alpha_values = self.compute_ema_sequences(
+            torch.cat([batch_x[:, -1:].contiguous(), batch_y], dim=1)  # (B, 1+T_pred, C)
+        )
+        # t=1..T_pred만 사용
+        ema_all = ema_all[:, :, 1:]  # (B, A, T_pred, C)
 
-        if 'PEMS' == self.args.data or 'Solar' == self.args.data:
-            batch_x_mark = None
-            batch_y_mark = None
-        
-        return batch_x, batch_y, batch_x_mark, batch_y_mark
+        A = self.alphas.numel()
+        K = A - 1  # 단계 수
 
+        # 입력 x를 K번 복제
+        batch_x_rep = batch_x.unsqueeze(1).expand(-1, K, -1, -1).contiguous().view(-1, seq_len, feature_dim).to(self.device)
+        # y_{alpha_k} (이전)와 y_{alpha_{k-1}} (타깃)
+        batch_ema_y_prev = ema_all[:, 1:, :, :].contiguous().view(-1, T_pred, feature_dim).to(self.device)   # (B*K, T_pred, C)
+        batch_ema_y_target = ema_all[:, :-1, :, :].contiguous().view(-1, T_pred, feature_dim).to(self.device) # (B*K, T_pred, C)
+        # α 값도 길이를 K로 맞춰서 전개
+        alpha_values_k = alpha_values[:, 1:].contiguous().view(-1).to(self.device)  # (B*K,)
+
+        return batch_x_rep, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values_k
+
+    # ==== 역방향 복원 샘플링 ====
     def sampling(self, x, x_mark, y_mark):
+        """
+        강 스무딩(상수에 가까운 상태)에서 역순 α 스케줄로 복원
+        """
         batch_size = x.shape[0]
-        
-        x = x.to(self.device)
-        x_mark = x_mark.to(self.device) if x_mark is not None else None
-        y_mark = y_mark.to(self.device) if y_mark is not None else None
-        
-        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
+        # 🔧 dtype 통일
+        model_dtype = next(self.model.parameters()).dtype
+        x = x.to(self.device).to(model_dtype)
+        x_mark = x_mark.to(self.device).to(model_dtype) if x_mark is not None else None
+        y_mark = y_mark.to(self.device).to(model_dtype) if y_mark is not None else None
 
-        for alpha in torch.flip(self.alphas[1:], dims=[0]):
+        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1).to(model_dtype)
+        for alpha in self._alpha_steps_desc():
             output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
-        
         return output_t
-    
-    # differentiable sampling that returns all intermediate predictions as a tensor
+
+    # ==== 중간 단계까지의 모든 예측 텐서 반환(옵션) ====
     def sampling_with_intermediates_tensor(self, x, x_mark, y_mark):
+        """
+        (B, K, T_pred, C) 반환. 비용 큼. 필요할 때만 사용.
+        """
         batch_size = x.shape[0]
-        
-        x = x.to(self.device)
-        x_mark = x_mark.to(self.device) if x_mark is not None else None
-        y_mark = y_mark.to(self.device) if y_mark is not None else None
+        model_dtype = next(self.model.parameters()).dtype
+        x = x.to(self.device).to(model_dtype)
+        x_mark = x_mark.to(self.device).to(model_dtype) if x_mark is not None else None
+        y_mark = y_mark.to(self.device).to(model_dtype) if y_mark is not None else None
 
-        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
-        preds = []  # list of tensors, one per alpha step (reverse order)
-
-        for alpha in torch.flip(self.alphas[1:], dims=[0]):
+        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1).to(model_dtype)
+        preds = []
+        for alpha in self._alpha_steps_desc():
             output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
             preds.append(output_t)
+        return torch.stack(preds, dim=1)  # (B, K, T_pred, C)
 
-        # stack along step dimension: (B, num_steps=A-1, T_pred, C)
-        return torch.stack(preds, dim=1)
-    
-    # sampling for training
-    def sampling_with_intermediates(self, x, x_mark, y_mark):
-        batch_size = x.shape[0]
-        x = x.to(self.device)
-        x_mark = x_mark.to(self.device) if x_mark is not None else None
-        y_mark = y_mark.to(self.device) if y_mark is not None else None
-
-        output_t = x[:, -1].unsqueeze(1).repeat(1, self.args.pred_len, 1)
-        preds = []  # α step별 결과 기록
-
-        for alpha in torch.flip(self.alphas[1:], dims=[0]):
-            output_t = self.model(output_t, x, alpha.expand(batch_size).to(self.device))
-            preds.append(output_t.detach().cpu().numpy())
-
-        return preds
-
-    
-    # 이미지 저장 폴더 이름 설정
+    # ==== 런 이름 ====
     def _run_name(self, fallback: str) -> str:
         try:
             if wandb.run is not None:
@@ -168,57 +184,25 @@ class Global_Loss(object):
             pass
         return fallback
 
+    # ==== 검증 ====
     def vali(self, vali_data, vali_loader, criterion):
-        
-        step_losses = []
-        global_losses = []
-        
+        """
+        검증은 글로벌 복원 손실만 측정해 비용을 줄임.
+        """
+        total_loss = []
         self.model.eval()
         with torch.no_grad():
             pbar = tqdm(enumerate(vali_loader), total=len(vali_loader))
-            for i, (batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw) in pbar:
-                
-                # === step loss ===
-                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw)
-                
-                step_outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
-
-                step_loss = criterion(step_outputs, batch_ema_y_target)
-                step_losses.append(step_loss.item())
-                
-                # === global loss (final + intermediate EMA supervision) ===
-                preds_all = self.sampling_with_intermediates_tensor(
-                    batch_x_raw.float(),
-                    batch_x_mark_raw.float() if batch_x_mark_raw is not None else None,
-                    batch_y_mark_raw.float() if batch_y_mark_raw is not None else None,
-                )  # (B, A-1, T_pred, C)
-
-                ema_full, _ = self.compute_ema_sequences(
-                    torch.cat([batch_x_raw.float()[:, -1].unsqueeze(1), batch_y.float()], dim=1),
-                    interval=self.args.interval,
-                )  # (B, A, T_pred+1, C)
-                ema_full = ema_full[:, :, 1:]  # (B, A, T_pred, C)
-                targets_all = torch.flip(ema_full, dims=[1])[:, 1:, :, :].to(self.device)  # (B, A-1, T_pred, C), [0.95..0.0]
-
-                w_final = getattr(self.args, 'global_final_weight', 1.0)
-                w_inter = getattr(self.args, 'global_intermediate_weight', 1.0)
-                global_loss_final = criterion(preds_all[:, -1, :, :], batch_y.float().to(self.device))
-                global_loss_intermediate = criterion(preds_all, targets_all)
-                global_loss = w_final * global_loss_final + w_inter * global_loss_intermediate
-                global_losses.append(global_loss.item())
-                
-                # === tqdm 진행바에 step+global 동시 표시 ===
-                pbar.set_postfix(
-                    step_loss=step_loss.item(),
-                    global_loss=global_loss.item()
-                )
-        
-        step_loss_avg = np.mean(step_losses)
-        global_loss_avg = np.mean(global_losses)
-        total_loss_avg = step_loss_avg + global_loss_avg
-
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
+                batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch_for_test(batch_x, batch_y, batch_x_mark, batch_y_mark)
+                pred_y = self.sampling(batch_x, batch_x_mark, batch_y_mark)
+                true_y = batch_y.to(self.device)
+                loss = criterion(pred_y, true_y)
+                total_loss.append(loss.item())
+                pbar.set_postfix(loss=loss.item())
+        avg = float(np.mean(total_loss)) if total_loss else 0.0
         self.model.train()
-        return step_loss_avg, global_loss_avg, total_loss_avg
+        return avg
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -226,195 +210,118 @@ class Global_Loss(object):
         test_data, test_loader = self._get_data(flag='test')
 
         path = os.path.join(self.args.checkpoints, setting)
-        if not os.path.exists(path):
-            os.makedirs(path)
-            
-        # 이미지 저장 경로 세팅
+        os.makedirs(path, exist_ok=True)
+
+        # 사진경로
         run_name = self._run_name(setting)
         train_fig_dir = os.path.join('./figs', run_name, 'train')
         os.makedirs(train_fig_dir, exist_ok=True)
 
-        train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
-
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        # scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
-        #                                     steps_per_epoch=train_steps,
-        #                                     pct_start=self.args.pct_start,
-        #                                     epochs=self.args.train_epochs,
-        #                                     max_lr=self.args.learning_rate)
-
         for epoch in range(self.args.train_epochs):
             self.model.train()
-
             pbar = tqdm(enumerate(train_loader), total=len(train_loader))
-            
-            for i, (batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw) in pbar:
-                model_optim.zero_grad()
-                
-                batch_x, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values = self.process_batch(batch_x_raw, batch_y, batch_x_mark_raw, batch_y_mark_raw)
-                
-                # === 한 step loss ===
-                step_outputs = self.model(batch_ema_y_prev, batch_x, alpha_values)
-                
-                step_loss = criterion(step_outputs, batch_ema_y_target)
-                
-                # === global loss (final + intermediate EMA supervision) ===
-                # 1) differentiable intermediate predictions
-                preds_all = self.sampling_with_intermediates_tensor(
-                    batch_x_raw.float(),
-                    batch_x_mark_raw.float() if batch_x_mark_raw is not None else None,
-                    batch_y_mark_raw.float() if batch_y_mark_raw is not None else None,
-                )  # (B, A-1, T_pred, C)
 
-                # 2) build EMA targets for all alpha steps (reverse order)
-                ema_full, _ = self.compute_ema_sequences(
-                    torch.cat([batch_x_raw.float()[:, -1].unsqueeze(1), batch_y.float()], dim=1),
-                    interval=self.args.interval,
-                )  # (B, A, T_pred+1, C)
-                ema_full = ema_full[:, :, 1:]  # drop t=0 to keep only future horizon: (B, A, T_pred, C)
-                targets_all = torch.flip(ema_full[:, 1:, :, :].to(self.device), dims=[1])  # align with [1.0, ..., interval]
+            for i, (batch_x_raw, batch_y_raw, batch_x_mark_raw, batch_y_mark_raw) in pbar:
+                model_optim.zero_grad(set_to_none=True)
 
-                # 3) final y_true term + intermediate EMA term
-                t_true_y = batch_y.float().to(self.device)
-                t_pred_final = preds_all[:, -1, :, :]
-                global_loss_final = criterion(t_pred_final, t_true_y)
-                global_loss_intermediate = criterion(preds_all, targets_all)
-                global_loss = global_loss_final + global_loss_intermediate
-                
-                loss = global_loss + step_loss
+                # dtype/device 정렬
+                model_dtype = next(self.model.parameters()).dtype
+                batch_x = batch_x_raw.to(self.device).to(model_dtype)         # (B, T_in, C)
+                batch_y = batch_y_raw.to(self.device).to(model_dtype)         # (B, T_pred, C)
 
-                loss.backward()
-                model_optim.step()
+                # === 1) 랜덤 α 선택 =========================================
+                # self.alphas: [0, a1, a2, ..., 1] 길이 A
+                A = self.alphas.numel()
+                start_idx = torch.randint(low=1, high=A, size=(1,), device=self.device).item()  # 1..A-1
+                start_alpha = self.alphas[start_idx].item()
 
-                # if self.args.lradj == 'TST':
-                    # adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
-                    # scheduler.step()
-                    
-                # === 시각화: 100 스텝마다 1개 샘플 저장 + Metric 계산 ===
-                if i % 100 == 0:
+                # === 2) 해당 α에서의 corrupted 타깃 y_α 만들기 ==============
+                # 입력: 과거 마지막값 + 미래정답 전체  → EMA 전체 계산
+                ema_all, _ = self.compute_ema_sequences(
+                    torch.cat([batch_x[:, -1:].contiguous(), batch_y], dim=1)  # (B, 1+T_pred, C)
+                )  # (B, A, 1+T_pred, C)
+                ema_all = ema_all[:, :, 1:]                                    # (B, A, T_pred, C)
+                y_alpha = ema_all[:, start_idx, :, :].to(self.device)          # (B, T_pred, C)
+
+                # === 3) start_alpha → 0 까지 역방향 복원 =====================
+                # 알파 내림차순 중에서 start_alpha 이하만 사용
+                alphas_desc = torch.flip(self.alphas[1:], dims=[0]).to(self.device).to(model_dtype)  # (A-1,)
+                mask = alphas_desc <= start_alpha
+                alphas_to_apply = alphas_desc[mask]  # [start_alpha, ..., 가장 작은 양의 α]
+
+                output_t = y_alpha  # 초기 상태
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    for a in alphas_to_apply:
+                        a_exp = a.expand(batch_x.size(0))
+                        output_t = self.model(output_t, batch_x, a_exp)  # (B, T_pred, C)
+
+                    # === 4) 최종 복원 결과와 GT 비교 =========================
+                    loss = criterion(output_t, batch_y)
+
+                # === 5) backward + clip + step ===============================
+                self.scaler.scale(loss).backward()
+                if self.max_grad_norm and self.max_grad_norm > 0:
+                    self.scaler.unscale_(model_optim)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.scaler.step(model_optim)
+                self.scaler.update()
+
+                pbar.set_postfix(loss=float(loss.item()))
+                wandb.log({"epoch": epoch, "iteration": i, "train/total_loss": float(loss.item())})
+
+                # === 6) 간단한 시각화(옵션) ==================================
+                if hasattr(self, "plot_every") and self.plot_every and (i % self.plot_every == 0):
                     with torch.no_grad():
-                        # sampling을 이용해 원본 future 예측
-                        pred_y = self.sampling(batch_x[:1], batch_x_mark[:1], batch_y_mark[:1])
+                        # 완전 상수(α=1)에서 시작한 샘플 하나 시각화
+                        pred_y = self.sampling(batch_x[:1], None, None)  # sampling()이 내부에서 dtype/device 맞춤
                         true_y = batch_y[:1]
-
-                        # numpy 변환
                         pred_np = pred_y.detach().cpu().numpy()
                         true_np = true_y.detach().cpu().numpy()
                         x_np = batch_x[:1].detach().cpu().numpy()
-
-                        # 필요하면 inverse_transform 적용 (데이터셋에 따라)
                         if train_data.scale and self.args.inverse:
                             pred_np = train_data.inverse_transform(pred_np.reshape(-1, pred_np.shape[-1])).reshape(pred_np.shape)
                             true_np = train_data.inverse_transform(true_np.reshape(-1, true_np.shape[-1])).reshape(true_np.shape)
                             x_np = train_data.inverse_transform(x_np.reshape(-1, x_np.shape[-1])).reshape(x_np.shape)
-                            
-                        mse = np.mean((pred_np - true_np) ** 2)
-                        mae = np.mean(np.abs(pred_np - true_np))
-                        
-                        wandb.log({
-                            "epoch": epoch,
-                            "iteration": i,
-                            "train/sampling_mse": mse,
-                            "train/sampling_mae": mae,
-                        })
-
-                        # (과거 구간 + 미래 구간)으로 concat 해서 그림 그리기
                         gt = np.concatenate((x_np[0, :, -1], true_np[0, :, -1]), axis=0)
                         pd = np.concatenate((x_np[0, :, -1], pred_np[0, :, -1]), axis=0)
+                        visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{epoch}-{i}.pdf"))
 
-                        # 그림 저장
-                        if epoch is not None:
-                            visual(gt, pd, os.path.join(train_fig_dir, f"epoch_{epoch}-{i}.pdf"))
-                        else:
-                            visual(gt, pd, os.path.join(train_fig_dir, f"{i}.pdf"))
-                            
-                            
-                        # === step-by-step sampling =================================================
-                        # 추가로 매 스텝마다 loss, MSE, MAE 출력해보기
-                        preds = self.sampling_with_intermediates(batch_x[:1], batch_x_mark[:1], batch_y_mark[:1])
-                        true_y = batch_y[:1].detach().cpu().numpy()
-
-                        step_mses, step_maes = [], []
-                        for step_idx, pred in enumerate(preds):
-                            # shape: (1, T_pred, C)
-                            if train_data.scale and self.args.inverse:
-                                pred = train_data.inverse_transform(
-                                    pred.reshape(-1, pred.shape[-1])
-                                ).reshape(pred.shape)
-                                true_np = train_data.inverse_transform(
-                                    true_y.reshape(-1, true_y.shape[-1])
-                                ).reshape(true_y.shape)
-                            else:
-                                true_np = true_y
-
-                            mse = np.mean((pred - true_np) ** 2)
-                            mae = np.mean(np.abs(pred - true_np))
-                            step_mses.append(mse)
-                            step_maes.append(mae)
-
-                        # === wandb log ===
-                        wandb.log({
-                            "epoch": epoch,
-                            "iteration": i,
-                            "train/sampling_step_mse": step_mses,
-                            "train/sampling_step_mae": step_maes,
-                        })
-
-                        # === 그래프 저장 ===
-                        plt.figure()
-                        plt.plot(step_mses, label="MSE")
-                        plt.plot(step_maes, label="MAE")
-                        plt.xlabel("alpha step (reverse)")
-                        plt.ylabel("Loss")
-                        plt.legend()
-                        plt.title(f"Sampling losses at epoch {epoch}, iter {i}")
-                        plt.tight_layout()
-                        plt.savefig(os.path.join(train_fig_dir, f"epoch_{epoch}-{i}_loss_curve.pdf"))
-                        plt.close()
-                        
-                        # ============================================================================
-
-
-                wandb.log({
-                    "epoch": epoch,
-                    "iteration": i,
-                    "train/step_loss": step_loss.item(),
-                    "train/global_loss": global_loss.item(),
-                    "train/total_loss": loss.item()
-                })
-
-                pbar.set_postfix(loss=loss.item())
-
-            vali_step_loss, vali_global_loss, vali_total_loss = self.vali(vali_data, vali_loader, criterion)
-            test_step_loss, test_global_loss, test_total_loss = self.vali(test_data, test_loader, criterion)
+            # === epoch 끝: 검증/테스트(샘플링 기반) ==========================
+            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion)
             self.test(setting, test=False, epoch=epoch)
+            wandb.log({"epoch": epoch, "val/loss": float(vali_loss), "test/loss": float(test_loss)})
 
-            wandb.log({
-                "epoch": epoch,
-                "val/loss": vali_total_loss,
-                "test/loss": test_total_loss,
-                "test/step_loss": test_step_loss,
-                "test/global_loss": test_global_loss,
-            })
-
-            print("Epoch: {} | Vali Loss: {:.7f} Test Loss: {:.7f}".format(epoch + 1, vali_total_loss, test_total_loss))
-            early_stopping(vali_total_loss, self.model, path)
+            print(f"Epoch: {epoch+1} | Vali Loss: {vali_loss:.6f} Test Loss: {test_loss:.6f}")
+            early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
-            # if self.args.lradj != 'TST':
-            #     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=True)
-            # else:
-            #     print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
-
-        best_model_path = path + '/' + 'checkpoint.pth'
+        best_model_path = os.path.join(path, 'checkpoint.pth')
         self.model.load_state_dict(torch.load(best_model_path))
-
+        try:
+            wandb.save(best_model_path)
+        except Exception:
+            pass
         return self.model
+
+
+    def process_batch_for_test(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
+        model_dtype = next(self.model.parameters()).dtype
+        batch_x = batch_x.to(model_dtype)
+        batch_y = batch_y.to(model_dtype)
+        if self.args.data in ('PEMS', 'Solar'):
+            batch_x_mark = None
+            batch_y_mark = None
+        else:
+            batch_x_mark = batch_x_mark.to(model_dtype) if batch_x_mark is not None else None
+            batch_y_mark = batch_y_mark.to(model_dtype) if batch_y_mark is not None else None
+        return batch_x, batch_y, batch_x_mark, batch_y_mark
 
     def test(self, setting, test, epoch=None):
         test_data, test_loader = self._get_data(flag='test')
@@ -424,7 +331,7 @@ class Global_Loss(object):
 
         preds = []
         trues = []
-        
+
         run_name = self._run_name(setting)
         test_fig_dr = os.path.join('./figs', run_name, 'test')
         os.makedirs(test_fig_dr, exist_ok=True)
@@ -434,28 +341,23 @@ class Global_Loss(object):
             pbar = tqdm(enumerate(test_loader), total=len(test_loader))
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
                 batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch_for_test(batch_x, batch_y, batch_x_mark, batch_y_mark)
-                
                 outputs = self.sampling(batch_x, batch_x_mark, batch_y_mark)
-                
+
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
 
-                pred = outputs
-                true = batch_y
+                preds.append(outputs)
+                trues.append(batch_y)
 
-                preds.append(pred)
-                trues.append(true)
-                if i % 10 == 0:
-                    input = batch_x.detach().cpu().numpy()
+                # 저장 빈도 제한
+                if self.plot_every and i % self.plot_every == 0:
+                    input_np = batch_x.detach().cpu().numpy()
                     if test_data.scale and self.args.inverse:
-                        shape = input.shape
-                        input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
-                    gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
-                    pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
-                    if epoch is not None:
-                        visual(gt, pd, os.path.join(test_fig_dr, f"epoch_{str(epoch)}-{str(i)}.pdf"))
-                    else:
-                        visual(gt, pd, os.path.join(test_fig_dr, f"{str(i)}.pdf"))
+                        shape = input_np.shape
+                        input_np = test_data.inverse_transform(input_np.squeeze(0)).reshape(shape)
+                    gt = np.concatenate((input_np[0, :, -1], batch_y[0, :, -1]), axis=0)
+                    pd = np.concatenate((input_np[0, :, -1], outputs[0, :, -1]), axis=0)
+                    visual(gt, pd, os.path.join(test_fig_dr, f"epoch_{str(epoch)}-{str(i)}.pdf" if epoch is not None else f"{str(i)}.pdf"))
 
         preds = np.concatenate(preds, axis=0)
         trues = np.concatenate(trues, axis=0)
@@ -471,8 +373,5 @@ class Global_Loss(object):
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
-        wandb.log({
-            'test/mse': mse,
-            'test/mae': mae,
-        })
+        wandb.log({'test/mse': mse, 'test/mae': mae})
         return

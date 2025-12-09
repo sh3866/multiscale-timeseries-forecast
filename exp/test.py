@@ -1,5 +1,4 @@
 import os
-import os
 import warnings
 import re
 
@@ -22,7 +21,8 @@ import torch.nn.functional as F
 
 warnings.filterwarnings('ignore')
 
-class Exp_Long_Term_Forecast(object):
+
+class Test(object):
     def __init__(self, args):
         self.args = args
         self.device = self._acquire_device()

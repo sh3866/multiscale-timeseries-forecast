@@ -1,18 +1,18 @@
-### export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=4
 
 ### Data description
 seq_len=96        # 96, 192, 336, 720
 feature_dim=7
 
 ### Training description
-learning_rate=0.01
+learning_rate=0.001
 #learning_rate=0.01
-batch_size=128
-train_epochs=20
+batch_size=64
+train_epochs=50
 
 ### Model description
 model_name=Ours
-interval=0.05
+interval=0.02
 hidden_dim=32
 num_heads=4
 num_dit_block=4
