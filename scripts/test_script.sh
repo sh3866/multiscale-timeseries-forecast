@@ -1,4 +1,4 @@
-### export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 
 ### Data description
 seq_len=96        # 96, 192, 336, 720
@@ -29,7 +29,7 @@ variate=S
 fig_tag="12_05_test"   # ★ 추가: 원하는 이름
 
 python -u run.py \
-  --task_name long_term_forecast \
+  --task_name test \
   --is_training 1 \
   --root_path  ./dataset/ETT-small/\
   --data_path ETTm2.csv \

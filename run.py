@@ -7,6 +7,7 @@ import wandb
 
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from exp.global_loss import Global_Loss
+from exp.test import Test
 
 
 def set_seed(seed):
@@ -78,6 +79,24 @@ def get_args():
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
     parser.add_argument('--devices', type=str, default='0,1', help='device ids of multile gpus')
     
+    # sunghyun =========================================================================================
+    parser.add_argument('--fig_tag', type=str, default='', help='prefix folder name under figs/')
+    
+    # ===== Statistical Predictor 관련 추가 옵션 =====
+    parser.add_argument('--use_ma_start', type=int, default=0,
+                        help='0: 기존 시작값(last_x), 1: GT EMA 기반 시작값, 2: μ/σ predictor 기반 시작값')
+    
+    parser.add_argument('--lambda_mu', type=float, default=0.0,
+                        help='weight for μ predictor loss')
+    
+    parser.add_argument('--lambda_traj', type=float, default=0.0,
+                        help='weight for traj loss')
+    parser.add_argument('--lambda_end', type=float, default=0.0,
+                        help='weight for end loss')
+    # sunghyun =========================================================================================
+
+
+    
     args = parser.parse_args()
     
     return args
@@ -103,7 +122,8 @@ if __name__ == '__main__':
     
     tasks = {
         'long_term_forecast': Exp_Long_Term_Forecast,
-        'global_loss': Global_Loss
+        'global_loss': Global_Loss,
+        'test': Test
     }
     exp = tasks[args.task_name](args)
 
