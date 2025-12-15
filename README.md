@@ -109,13 +109,31 @@ $$\mathbf{K}_{\alpha} = (1 - w) \cdot \mathbf{K}_{k_i} + w \cdot \mathbf{K}_{k_{
 
 where $i = \lfloor \alpha \cdot (|\mathcal{F}(T)| - 1) \rfloor$ and $w$ is the fractional part.
 
-The smoothed signal at level $\alpha$ is:
+#### Delta-Based Drift Correction
 
-$$\mathbf{y}^{(\alpha)} = \mathbf{K}_\alpha \mathbf{y}$$
+A key challenge arises during inference: when $\alpha = 1$, the smoothed signal converges to the mean of the target sequence, which is unknown at test time. To address this, we introduce a **delta-based drift correction** that anchors the diffusion process to the last observed value.
+
+**Problem:** At $\alpha = 1$, the MA-smoothed signal $\mathbf{K}_1 \mathbf{y}$ approaches the temporal mean $\bar{\mathbf{y}} = \frac{1}{T}\sum_t \mathbf{y}_t$, which is unavailable during inference.
+
+**Solution:** We define the delta (drift) as the difference between the mean and the last observation:
+
+$$\boldsymbol{\delta} = \bar{\mathbf{y}} - \mathbf{x}_{T_{in}}$$
+
+where $\mathbf{x}_{T_{in}}$ is the last value of the context sequence. We then subtract a linearly interpolated drift term from the smoothed signal:
+
+$$\tilde{\mathbf{y}}^{(\alpha)} = \mathbf{K}_\alpha \mathbf{y} - \alpha \cdot \boldsymbol{\delta}$$
+
+This ensures:
+- At $\alpha = 0$: $\tilde{\mathbf{y}}^{(0)} = \mathbf{y}$ (original signal, no drift subtracted)
+- At $\alpha = 1$: $\tilde{\mathbf{y}}^{(1)} = \bar{\mathbf{y}} - \boldsymbol{\delta} = \mathbf{x}_{T_{in}}$ (signal anchored to last observation)
+
+**Interpretation:** Instead of denoising from an unknown mean, the model learns to denoise from a known starting point (the last observation) by gradually adding the delta over the reverse diffusion process. The model effectively learns:
+
+$$f_\theta: \mathbf{x}_{T_{in}} + \text{(learned temporal variations)} \rightarrow \mathbf{y}$$
 
 **Properties:**
 - $\alpha \approx 0$: Near identity transformation (original signal)
-- $\alpha \approx 1$: Strong smoothing (trend/constant approximation)
+- $\alpha \approx 1$: Signal anchored to last observation $\mathbf{x}_{T_{in}}$
 
 ### Training Algorithm
 
@@ -184,11 +202,13 @@ return ŷ
 
 1. **Structured Corruption:** Moving average provides a semantically meaningful corruption path - from trends to details - unlike random Gaussian noise.
 
-2. **Mean-Aware Initialization:** Starting from the last observation provides a reasonable estimate of the signal's central tendency, which the model then refines by adding temporal variations.
+2. **Delta-Based Drift Correction:** The key innovation is subtracting a linearly interpolated drift term $\alpha \cdot \boldsymbol{\delta}$ from the smoothed signal. This anchors the diffusion process at $\alpha=1$ to the last observation (which is known at inference time) rather than the unknown future mean. The model learns to progressively add the delta back during denoising, effectively predicting the deviation from the last observation.
 
-3. **Step-wise Supervision:** Training with intermediate targets at each alpha level provides dense supervision, improving gradient flow and convergence.
+3. **Known Starting Point:** At inference time, we initialize from the last observation $\mathbf{x}_{T_{in}}$ and denoise toward the target. This is possible because the drift correction ensures that the corrupted signal at $\alpha=1$ equals the last observation, eliminating the need to know the future mean.
 
-4. **Cross-Attention Conditioning:** Historical context guides the denoising process through cross-attention, allowing the model to leverage temporal patterns from the past.
+4. **Step-wise Supervision:** Training with intermediate targets at each alpha level provides dense supervision, improving gradient flow and convergence.
+
+5. **Cross-Attention Conditioning:** Historical context guides the denoising process through cross-attention, allowing the model to leverage temporal patterns from the past.
 
 ## Model Configuration
 
@@ -272,13 +292,18 @@ python run.py \
 
 ## Mathematical Summary
 
-**Forward Process (Corruption):**
-$$\mathbf{y}^{(\alpha)} = \mathbf{K}_\alpha \mathbf{y}, \quad \alpha \in [0, 1]$$
+**Forward Process (Corruption with Drift Correction):**
+
+$$\boldsymbol{\delta} = \bar{\mathbf{y}} - \mathbf{x}_{T_{in}}, \quad \tilde{\mathbf{y}}^{(\alpha)} = \mathbf{K}_\alpha \mathbf{y} - \alpha \cdot \boldsymbol{\delta}$$
+
+where $\bar{\mathbf{y}}$ is the temporal mean of the target and $\mathbf{x}_{T_{in}}$ is the last observed value.
 
 **Reverse Process (Denoising):**
-$$\mathbf{y}^{(\alpha_{k-1})} = f_\theta(\mathbf{y}^{(\alpha_k)}, \mathbf{x}, \alpha_k)$$
+$$\tilde{\mathbf{y}}^{(\alpha_{k-1})} = f_\theta(\tilde{\mathbf{y}}^{(\alpha_k)}, \mathbf{x}, \alpha_k)$$
+
+Starting from the last observation at $\alpha = 1$, the model iteratively refines toward the target signal at $\alpha = 0$.
 
 **Training Objective:**
-$$\mathcal{L} = \lambda_{traj} \cdot \frac{1}{K} \sum_{k=1}^{K} \|\hat{\mathbf{y}}^{(\alpha_{k-1})} - \mathbf{y}^{(\alpha_{k-1})}\|^2 + \lambda_{end} \cdot \|\hat{\mathbf{y}} - \mathbf{y}\|^2$$
+$$\mathcal{L} = \lambda_{traj} \cdot \frac{1}{K} \sum_{k=1}^{K} \|\hat{\mathbf{y}}^{(\alpha_{k-1})} - \tilde{\mathbf{y}}^{(\alpha_{k-1})}\|^2 + \lambda_{end} \cdot \|\hat{\mathbf{y}} - \mathbf{y}\|^2$$
 
 where $K$ is the number of denoising steps sampled during training.
