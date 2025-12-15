@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=4
 
 ### Data description
 seq_len=96        # 96, 192, 336, 720
@@ -8,7 +8,7 @@ feature_dim=1
 learning_rate=0.0001
 #learning_rate=0.01
 batch_size=32
-train_epochs=50
+train_epochs=100
 
 ### Model description
 model_name=Ours
@@ -18,7 +18,7 @@ num_heads=4
 num_dit_block=4
 
 ### 🔥 추가 옵션들 — 여기를 바꾸면 바로 적용됨 🔥
-use_ma_start=1          # 0 = 기존 x 확장/ 1 = peaking(EMA) / 2 = predictor 사용
+use_ma_start=0          # 0 = 기존 x 확장/ 1 = peaking(EMA) / 2 = predictor 사용
 
 lambda_mu=0.0           # μ predictor loss weight / 사용시 1.0
 lambda_traj=1.0
@@ -26,7 +26,7 @@ lambda_end=1.0
 
 variate=S
 
-fig_tag="12_05_test"   # ★ 추가: 원하는 이름
+fig_tag="12_11_newmethod"   # ★ 추가: 원하는 이름
 
 python -u run.py \
   --task_name test \

@@ -15,8 +15,6 @@ from utils.tools import EarlyStopping, visual
 from utils.metrics import metric
 from models import get_model
 
-from models.stat_predictor import StatPredictor
-
 import torch.nn.functional as F
 
 warnings.filterwarnings('ignore')
@@ -30,16 +28,6 @@ class Test(object):
         
         
         self.enable_mu_predictor = (getattr(self.args, "use_ma_start", 0) == 2)
-        
-        if self.enable_mu_predictor:  
-            self.stat_mu = StatPredictor(
-                input_dim=self.args.feature_dim,
-                hidden_dim=self.args.hidden_dim,
-                output_dim=self.args.feature_dim
-            ).to(self.device)
-        else:
-            self.stat_mu = None
-        
         
 
         # ==== α 그리드 안정화: linspace로 고정 개수 생성 ====
@@ -248,6 +236,24 @@ class Test(object):
         outs_alpha = outs_alpha.permute(2, 0, 1)     # (B*C, A, T)
         outs_alpha = outs_alpha.reshape(B, C, A, T)  # (B, C, A, T)
         ema_outputs = outs_alpha.permute(0, 2, 3, 1) # (B, A, T, C)
+        
+        # === 4.5 Drift term 추가 (마지막 값 attractor) ===
+
+        # (B, 1, 1, C)
+        last_val = x[:, :1, :]  
+        mean_val = x.mean(dim=1, keepdim=True)
+        n = mean_val - last_val   # (B, 1, 1, C)
+        n = n.unsqueeze(2)  
+
+        # (A,) → (1,A,1,1)
+        step_factors = torch.linspace(0, 1, A, device=device, dtype=dtype)
+        step_factors = step_factors.view(1, A, 1, 1)
+
+        # n: (B,1,1,C) → (B,1,1,C) 그대로 broadcast됨
+        drift = step_factors * n              # (B,A,1,C)
+
+        # subtract drift
+        ema_outputs = ema_outputs - drift
 
         # ------------------ 5. α 값 브로드캐스트 ------------------
         alpha_values = alphas.unsqueeze(0).expand(B, A)  # (B, A)
@@ -321,9 +327,10 @@ class Test(object):
         # 시작 상태 결정
         # =======================================================
         if mode == 2:
-            # stat predictor로 μ 예측
-            mu_hat = self.stat_mu(x)  # (B, C)
+            # DiT 내부 μ-head로 μ 예측 (과거 x만 사용)
+            mu_hat = self.model.predict_mu(x)          # (B, C)
             output_t = mu_hat.unsqueeze(1).expand(batch_size, T_pred, -1)
+
 
 
         elif mode == 1 and (y is not None):
@@ -386,9 +393,10 @@ class Test(object):
 
         # ---- 초기 상태 결정 (sampling 과 동일) ----
         if mode == 2:
-            # stat predictor로 μ 예측
-            mu_hat = self.stat_mu(x)  # (B, C)
+            # DiT 내부 μ-head로 μ 예측
+            mu_hat = self.model.predict_mu(x)          # (B, C)
             output_t = mu_hat.unsqueeze(1).expand(batch_size, T_pred, -1)
+
 
         elif mode == 1 and (y is not None):
             y = y.to(self.device).to(model_dtype)
@@ -460,10 +468,8 @@ class Test(object):
         검증은 글로벌 복원 손실만 측정해 비용을 줄임.
         """
         total_loss = []
-        self.model.eval()
         
-        if self.stat_mu is not None:
-            self.stat_mu.eval()
+        self.model.eval()
         
         with torch.no_grad():
             pbar = tqdm(enumerate(vali_loader), total=len(vali_loader))
@@ -497,15 +503,53 @@ class Test(object):
 
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         
-        if self.enable_mu_predictor and self.stat_mu is not None:
-            model_optim = optim.Adam(
-                list(self.model.parameters()) + list(self.stat_mu.parameters()),
-                lr=self.args.learning_rate
-            )
-        else:
-            model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+
 
         criterion = self._select_criterion()
+        
+        # ==============================================================
+        #  학습 시작 전에: test 샘플 10개 EMA smoothing 전체 시각화
+        # ==============================================================
+
+        # train_data, train_loader = self._get_data(flag='train')
+        # batch_x, batch_y, _, _ = next(iter(train_loader))
+        # batch_x = batch_x[:10].to(self.device)   # (10, T_in, C)
+        # batch_y = batch_y[:10].to(self.device)   # (10, T_out, C)
+
+        # # [past_last, future] 연결
+        # xy = torch.cat([batch_x[:, -1:], batch_y], dim=1)  # (10, 1+T_out, C)
+
+        # # EMA 전체 생성
+        # ema_all, _ = self.compute_ema_sequences(xy)  # (10, A, 1+T_out, C)
+        # ema_all = ema_all[:, :, 1:, :]               # (10, A, T_out, C)
+
+        # B, A, T_pred, C = ema_all.shape
+
+        # fig_root = self._fig_root(setting)
+        # plot_root = os.path.join(fig_root, 'ema_all_init')   # 초기 EMA 시각화 폴더
+        # os.makedirs(plot_root, exist_ok=True)
+
+        # for s in range(B):  # 10개
+        #     sample_dir = os.path.join(plot_root, f'sample{s+1}')
+        #     os.makedirs(sample_dir, exist_ok=True)
+
+        #     true = batch_y[s, :, -1].detach().cpu().numpy()
+
+        #     for idx in range(A):
+        #         alpha = float(self.alphas[idx].item())
+        #         pred_alpha = ema_all[s, idx, :, -1].detach().cpu().numpy()
+
+        #         plt.figure()
+        #         plt.plot(true, label='Original Future')
+        #         plt.plot(pred_alpha, label=f'EMA α={alpha:.2f}')
+        #         plt.legend()
+        #         plt.title(f'[Init EMA] Sample {s+1} (α={alpha:.2f})')
+        #         plt.savefig(os.path.join(sample_dir, f'ema_alpha_{alpha:.2f}.pdf'))
+        #         plt.close()
+
+        # print(">>> 초기 EMA smoothing 10개 시각화 완료")
+        
         
         # ========================================================
         lambda_traj = getattr(self.args, "lambda_traj", 1.0)
@@ -517,10 +561,6 @@ class Test(object):
 
         for epoch in range(self.args.train_epochs):
             self.model.train()
-            
-            if self.enable_mu_predictor and self.stat_mu is not None:
-               self.stat_mu.train()
-               
             
             pbar = tqdm(enumerate(train_loader), total=len(train_loader))
 
@@ -543,29 +583,6 @@ class Test(object):
                 A = self.alphas.numel()
                 start_idx = torch.randint(low=1, high=A, size=(1,), device=self.device).item()  # 1..A-1
                 start_alpha = self.alphas[start_idx].item()
-
-                # # === 2) 해당 α에서의 corrupted 타깃 y_α 만들기 ==============
-                # # 입력: 과거 마지막값 + 미래정답 전체  → EMA 전체 계산
-                # ema_all, _ = self.compute_ema_sequences(
-                #     torch.cat([batch_x[:, -1:].contiguous(), batch_y], dim=1)  # (B, 1+T_pred, C)
-                # )  # (B, A, 1+T_pred, C)
-                # ema_all = ema_all[:, :, 1:]                                    # (B, A, T_pred, C)
-                # y_alpha = ema_all[:, start_idx, :, :].to(self.device)          # (B, T_pred, C)
-
-                # # === 3) start_alpha → 0 까지 역방향 복원 =====================
-                # # 알파 내림차순 중에서 start_alpha 이하만 사용
-                # alphas_desc = torch.flip(self.alphas[1:], dims=[0]).to(self.device).to(model_dtype)  # (A-1,)
-                # mask = alphas_desc <= start_alpha
-                # alphas_to_apply = alphas_desc[mask]  # [start_alpha, ..., 가장 작은 양의 α]
-
-                # output_t = y_alpha  # 초기 상태
-                # with torch.cuda.amp.autocast(enabled=self.use_amp):
-                #     for a in alphas_to_apply:
-                #         a_exp = a.expand(batch_x.size(0))
-                #         output_t = self.model(output_t, batch_x, a_exp)  # (B, T_pred, C)
-
-                #     # === 4) 최종 복원 결과와 GT 비교 =========================
-                #     loss = criterion(output_t, batch_y)
                 
                 # === 2) 해당 α에서의 corrupted 타깃 y_α 만들기 ==============
                 # 입력: 과거 마지막값 + 미래정답 전체  → EMA 전체 계산
@@ -576,54 +593,67 @@ class Test(object):
                 ema_all = ema_all.to(model_dtype)
 
                 A = self.alphas.numel()
-                start_idx = torch.randint(low=1, high=A, size=(1,), device=self.device).item()  # 1..A-1
+                # 1..A-1 범위에서 2개 랜덤 선택
+                idx1 = torch.randint(1, A, (1,), device=self.device).item()
+                idx2 = torch.randint(1, A, (1,), device=self.device).item()
+
+                # 큰 쪽이 start / 작은 쪽이 end
+                start_idx = max(idx1, idx2)
+                end_idx = min(idx1, idx2)
+
+                # 최소 1차이는 나게 하기 (동일 인덱스 방지)
+                if start_idx == end_idx:
+                    if start_idx < A-1:
+                        start_idx += 1
+                    else:
+                        end_idx -= 1
 
                 # teacher에서 start step 상태 (y_{alpha_start})
                 y_alpha = ema_all[:, start_idx, :, :]                          # (B, T_pred, C)
 
                 # === 3) start_idx → 0 까지 step-wise trajectory 학습 ============
-                # alpha index는 start_idx, start_idx-1, ..., 1 순서로 사용
-                #   각 step에서:
-                #     현재 상태:   output_t (α_k)
-                #     입력 alpha:  α_k
-                #     타깃 상태:   ema_all[:, k-1] (α_{k-1})
 
                 output_t = y_alpha  # 초기 상태: teacher EMA at start_idx
                 traj_loss = 0.0
                 num_traj_steps = 0
 
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    for alpha_idx in range(start_idx, 0, -1):  # start_idx, ..., 1
-                        # 현재 step에서 사용할 alpha 값 (스칼라 → (B,) 로 브로드캐스트)
+                    # === 2) start_idx → end_idx+1 까지만 반복 ===
+                    for alpha_idx in range(start_idx, end_idx, -1):
                         a_val = self.alphas[alpha_idx].to(self.device).to(model_dtype)
-                        a_exp = a_val.expand(batch_x.size(0))
+                        a_exp = a_val.expand(batch_x.shape[0])
 
-                        # 한 step 진행: α_k 에서 α_{k-1} 방향으로 이동
-                        output_t = self.model(output_t, batch_x, a_exp)  # (B, T_pred, C)
+                        # predict α_{k-1}
+                        output_t = self.model(output_t, batch_x, a_exp)
 
-                        # teacher EMA에서 α_{k-1} 상태를 타깃으로 사용
-                        teacher_next = ema_all[:, alpha_idx - 1, :, :]    # (B, T_pred, C)
-
+                        # teacher EMA target
+                        teacher_next = ema_all[:, alpha_idx - 1, :, :]
                         step_loss = criterion(output_t, teacher_next)
-                        traj_loss = traj_loss + step_loss
+                        traj_loss += step_loss
                         num_traj_steps += 1
 
                     if num_traj_steps > 0:
-                        traj_loss = traj_loss / num_traj_steps
+                        traj_loss /= num_traj_steps
 
-                    # 마지막 상태는 α≈0 근처 → 원본 y와도 직접 맞추도록 end loss 추가
-                    end_loss = criterion(output_t, batch_y)
+                    # === 3) end loss를 "end_idx" 에서의 teacher EMA 또는 GT 비교로 선택 ===
+                    if end_idx == 0:
+                        # end_idx = 0 → 진짜 Ground Truth 비교
+                        end_loss = criterion(output_t, batch_y)
+                    else:
+                        # 중간 end이면 Teacher EMA 비교
+                        end_loss = criterion(output_t, ema_all[:, end_idx, :, :])
 
                     # loss = lambda_traj * traj_loss + lambda_end * end_loss
                     
                     # === μ loss (Mean predictor) =======================================
                     mu_loss = torch.tensor(0.0, device=self.device, dtype=model_dtype)
 
-                    if self.enable_mu_predictor and self.stat_mu is not None:
-                        T_pred = self.args.pred_len
-                        mu_hat = self.stat_mu(batch_x)      # (B, C)
-                        true_mu = batch_y.mean(dim=1)       # (B, C)
+                    if self.enable_mu_predictor:
+                        # DiT 내부 μ-head 사용
+                        mu_hat = self.model.predict_mu(batch_x)   # (B, C)
+                        true_mu = batch_y.mean(dim=1)             # (B, C)
                         mu_loss = criterion(mu_hat, true_mu)
+
 
                     # lambda_mu 는 mode==2에서만 활성화
                     effective_lambda_mu = lambda_mu if self.enable_mu_predictor else 0.0
@@ -694,41 +724,7 @@ class Test(object):
             wandb.save(best_model_path)
         except Exception:
             pass
-        
-        # ============================================
-        # (추가) 학습 종료 후: EMA α=0.25, 0.50 시각화
-        # ============================================
-        # === EMA smoothing 전체 시각화 ===
-        test_data, test_loader = self._get_data(flag='test')
-        batch_x, batch_y, _, _ = next(iter(test_loader))
-        batch_x = batch_x[:1].to(self.device)
-        batch_y = batch_y[:1].to(self.device)
 
-        xy = torch.cat([batch_x[:, -1:], batch_y], dim=1)
-        ema_all, _ = self.compute_ema_sequences(xy)
-        ema_all = ema_all[:, :, 1:, :]  # (1, A, T_pred, C)
-
-        A = ema_all.shape[1]
-        # plot_dir = os.path.join('./figs', run_name, 'ema_all')
-        fig_root = self._fig_root(setting)
-        plot_dir = os.path.join(fig_root, 'ema_all')
-        os.makedirs(plot_dir, exist_ok=True)
-
-        # C 중 마지막 피쳐만 사용해 그림 저장
-        true = batch_y[0, :, -1].detach().cpu().numpy()
-        
-        for idx in range(A):
-            alpha = float(self.alphas[idx].item())
-            pred_alpha = ema_all[0, idx, :, -1].detach().cpu().numpy()
-
-            plt.figure()
-            plt.plot(true, label='Original Future')
-            plt.plot(pred_alpha, label=f'EMA α={alpha:.2f}')
-            plt.legend()
-            plt.title(f'EMA Smoothing (alpha={alpha:.2f})')
-            plt.savefig(os.path.join(plot_dir, f'ema_alpha_{alpha:.2f}.pdf'))
-            plt.close()
-        
         return self.model
 
 
@@ -770,8 +766,6 @@ class Test(object):
         alpha_values_desc_np = alpha_values_desc.detach().cpu().numpy()
 
         self.model.eval()
-        if self.stat_mu is not None:
-            self.stat_mu.eval()
     
         with torch.no_grad():
             pbar = tqdm(enumerate(test_loader), total=len(test_loader))
@@ -914,152 +908,3 @@ class Test(object):
         print('mse:{}, mae:{}'.format(mse, mae))
         wandb.log({'test/mse': mse, 'test/mae': mae})
         return
-
-
-    # def test(self, setting, test, epoch=None):
-    #     test_data, test_loader = self._get_data(flag='test')
-    #     if test:
-    #         print('loading model')
-    #         self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
-
-    #     preds = []
-    #     trues = []
-
-    #     run_name = self._run_name(setting)
-    #     test_fig_dr = os.path.join('./figs', run_name, 'test')
-    #     os.makedirs(test_fig_dr, exist_ok=True)
-
-    #     # 🔹 alpha 시각화 루트 폴더 (./figs/<run_name>/alpha)
-    #     alpha_root_dir = os.path.join('./figs', run_name, 'alpha')
-    #     os.makedirs(alpha_root_dir, exist_ok=True)
-
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         pbar = tqdm(enumerate(test_loader), total=len(test_loader))
-    #         for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
-    #             batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch_for_test(
-    #                 batch_x, batch_y, batch_x_mark, batch_y_mark
-    #             )
-    #             outputs = self.sampling(batch_x, batch_x_mark, batch_y_mark)
-
-    #             # ===========================
-    #             # (추가) α 스텝별 중간 결과 저장
-    #             # ===========================
-    #             # 첫 배치에서만, 최대 10개 샘플에 대해 저장
-    #             if i == 0:
-    #                 # 현재 배치에서 사용할 샘플 수 (최대 10개)
-    #                 B_cur = batch_x.shape[0]
-    #                 n_vis = min(10, B_cur)
-
-    #                 # (n_vis, K, T_pred, C)  — 모든 alpha step 에서의 예측
-    #                 preds_all = self.sampling_with_intermediates_tensor(
-    #                     batch_x[:n_vis], batch_x_mark[:n_vis], batch_y_mark[:n_vis]
-    #                 )  # (n_vis, K, T_pred, C)
-
-    #                 preds_all_np = preds_all.detach().cpu().numpy()
-    #                 input_np = batch_x[:n_vis].detach().cpu().numpy()  # (n_vis, T_in, C)
-    #                 true_np = batch_y[:n_vis].detach().cpu().numpy()   # (n_vis, T_pred, C)
-
-    #                 # 스케일 복원 (PEMS, 기타 scale=True & inverse=True 인 경우)
-    #                 if test_data.scale and self.args.inverse:
-    #                     # input
-    #                     shape_in = input_np.shape  # (n_vis, T_in, C)
-    #                     input_np = test_data.inverse_transform(
-    #                         input_np.reshape(-1, shape_in[-1])
-    #                     ).reshape(shape_in)
-
-    #                     # true
-    #                     shape_true = true_np.shape  # (n_vis, T_pred, C)
-    #                     true_np = test_data.inverse_transform(
-    #                         true_np.reshape(-1, shape_true[-1])
-    #                     ).reshape(shape_true)
-
-    #                     # preds_all
-    #                     shape_pred = preds_all_np.shape  # (n_vis, K, T_pred, C)
-    #                     preds_all_np = test_data.inverse_transform(
-    #                         preds_all_np.reshape(-1, shape_pred[-1])
-    #                     ).reshape(shape_pred)
-
-    #                 K = preds_all_np.shape[1]  # alpha step 개수
-
-    #                 # 샘플별로 1~n_vis 폴더 생성
-    #                 for s_idx in range(n_vis):
-    #                     sample_dir = os.path.join(alpha_root_dir, f"{s_idx+1}")
-    #                     os.makedirs(sample_dir, exist_ok=True)
-
-    #                     history = input_np[s_idx, :, -1]   # (T_in,)
-    #                     gt = true_np[s_idx, :, -1]         # (T_pred,)
-
-    #                     for k in range(K):
-    #                         pred_step = preds_all_np[s_idx, k, :, -1]  # (T_pred,)
-
-    #                         plt.figure(figsize=(10, 4))
-    #                         # 과거
-    #                         plt.plot(
-    #                             range(len(history)),
-    #                             history,
-    #                             label="history"
-    #                         )
-    #                         # 정답 future
-    #                         plt.plot(
-    #                             range(len(history), len(history) + len(gt)),
-    #                             gt,
-    #                             label="true"
-    #                         )
-    #                         # 해당 alpha step 예측
-    #                         plt.plot(
-    #                             range(len(history), len(history) + len(pred_step)),
-    #                             pred_step,
-    #                             label=f"pred α-step {k+1}"
-    #                         )
-    #                         plt.legend()
-    #                         plt.title(f"Sample {s_idx+1} | Alpha Step {k+1}")
-    #                         plt.tight_layout()
-
-    #                         save_path = os.path.join(sample_dir, f"alpha_{k+1}.pdf")
-    #                         plt.savefig(save_path)
-    #                         plt.close()
-
-    #             # ===========================
-    #             # (기존) test용 예측/정답 저장
-    #             # ===========================
-    #             outputs = outputs.detach().cpu().numpy()
-    #             batch_y = batch_y.detach().cpu().numpy()
-
-    #             preds.append(outputs)
-    #             trues.append(batch_y)
-
-    #             # 저장 빈도 제한 (기존 로직 그대로)
-    #             if self.plot_every and i % self.plot_every == 0:
-    #                 input_np = batch_x.detach().cpu().numpy()
-    #                 if test_data.scale and self.args.inverse:
-    #                     shape = input_np.shape
-    #                     input_np = test_data.inverse_transform(input_np.squeeze(0)).reshape(shape)
-    #                 gt = np.concatenate((input_np[0, :, -1], batch_y[0, :, -1]), axis=0)
-    #                 pd = np.concatenate((input_np[0, :, -1], outputs[0, :, -1]), axis=0)
-    #                 visual(
-    #                     gt,
-    #                     pd,
-    #                     os.path.join(
-    #                         test_fig_dr,
-    #                         f"epoch_{str(epoch)}-{str(i)}.pdf" if epoch is not None else f"{str(i)}.pdf"
-    #                     )
-    #                 )
-
-    #     preds = np.concatenate(preds, axis=0)
-    #     trues = np.concatenate(trues, axis=0)
-    #     print('test shape:', preds.shape, trues.shape)
-    #     preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-    #     trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-    #     print('test shape:', preds.shape, trues.shape)
-
-    #     if self.args.data == 'PEMS':
-    #         B, T, C = preds.shape
-    #         preds = test_data.inverse_transform(preds.reshape(-1, C)).reshape(B, T, C)
-    #         trues = test_data.inverse_transform(trues.reshape(-1, C)).reshape(B, T, C)
-
-    #     mae, mse, rmse, mape, mspe = metric(preds, trues)
-    #     print('mse:{}, mae:{}'.format(mse, mae))
-    #     wandb.log({'test/mse': mse, 'test/mae': mae})
-    #     return
-
