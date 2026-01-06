@@ -83,3 +83,7 @@ ehthumbs.db
 *.tmp
 *.temp
 .cache/
+
+# Large dataset folders
+dataset_matsd/
+sweeps/
