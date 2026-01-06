@@ -44,7 +44,6 @@ venv.bak/
 .ipynb_checkpoints
 
 # Data and results
-dataset/
 datasets/
 data/
 results/
@@ -86,6 +85,6 @@ ehthumbs.db
 nohup.out
 
 # Large dataset folders
+dataset/
 dataset_matsd/
-sweeps/
 testscripts/

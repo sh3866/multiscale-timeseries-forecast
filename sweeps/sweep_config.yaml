@@ -1,0 +1,103 @@
+method: bayes
+metric:
+  name: test/mse
+  goal: minimize
+
+parameters:
+  # ========== Sweep Parameters (하이퍼파라미터 탐색) ==========
+  hidden_dim:
+    values: [32, 64, 128]
+
+  num_heads:
+    values: [4, 8, 16]
+
+  num_dit_block:
+    values: [2, 4, 6, 8]
+
+  interval:
+    values: [0.1]
+
+  learning_rate:
+    values: [0.0001]
+
+  batch_size:
+    values: [32]
+
+  lambda_traj:
+    values: [1.0]
+
+  lambda_end:
+    values: [1.0]
+
+  # ========== Fixed Parameters (모든 실험 공통) ==========
+  # Task configuration
+  task_name:
+    value: 'test'
+  is_training:
+    value: 1
+  model:
+    value: 'Ours'
+  seed:
+    value: 0
+
+  # Sequence configuration
+  seq_len:
+    value: 96
+  label_len:
+    value: 0
+  pred_len:
+    value: 96
+
+  # Training configuration
+  train_epochs:
+    value: 100
+  patience:
+    value: 50
+  loss:
+    value: 'MSE'
+  use_amp:
+    value: false
+  lradj:
+    value: 'type1'
+  pct_start:
+    value: 0.2
+
+  # Model architecture
+  mlp_ratio:
+    value: 4.0
+  embed:
+    value: 'timeF'
+
+  # Loss configuration
+  use_ma_start:
+    value: 0
+  lambda_mu:
+    value: 0.0
+
+  # Data loader
+  num_workers:
+    value: 10
+  drop_last:
+    value: true
+
+  # Visualization
+  fig_tag:
+    value: 'sweep'
+  exp_tag:
+    value: ''
+  plot_every:
+    value: 0
+
+  # Other
+  checkpoints:
+    value: './checkpoints/'
+  seasonal_patterns:
+    value: 'Monthly'
+  inverse:
+    value: false
+  comment:
+    value: 'sweep'
+  freq:
+    value: 'h'
+  target:
+    value: 'OT'
