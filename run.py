@@ -81,18 +81,25 @@ def get_args():
     
     # sunghyun =========================================================================================
     parser.add_argument('--fig_tag', type=str, default='', help='prefix folder name under figs/')
-    
+    parser.add_argument('--exp_tag', type=str, default='', help='additional tag for wandb run name (e.g., parameter_test, ablation)')
+
     # ===== Statistical Predictor 관련 추가 옵션 =====
     parser.add_argument('--use_ma_start', type=int, default=0,
                         help='0: 기존 시작값(last_x), 1: GT EMA 기반 시작값, 2: μ/σ predictor 기반 시작값')
-    
+
     parser.add_argument('--lambda_mu', type=float, default=0.0,
                         help='weight for μ predictor loss')
-    
+
     parser.add_argument('--lambda_traj', type=float, default=0.0,
                         help='weight for traj loss')
     parser.add_argument('--lambda_end', type=float, default=0.0,
                         help='weight for end loss')
+
+    # ===== CATS (Auxiliary Time Series) 관련 옵션 =====
+    parser.add_argument('--num_aux', type=int, default=8,
+                        help='number of auxiliary time series for CATS model')
+    parser.add_argument('--lambda_cont', type=float, default=0.1,
+                        help='weight for continuity loss in CATS')
     # sunghyun =========================================================================================
 
 
@@ -114,12 +121,21 @@ if __name__ == '__main__':
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
     
-    wandb.init(project='time_series_diffusion')
+    # ⭐️ wandb run name 생성: 데이터셋_seqlen_predlen_variate_exptag 형식
+    # 예: ETTm1_96_96_S, electricity_96_192_M_parameter_test, weather_96_336_S_ablation
+    dataset_name = args.data if args.data != 'custom' else args.data_path.replace('.csv', '')
+    run_name = f"{dataset_name}_{args.seq_len}_{args.pred_len}_{args.features}"
+
+    # exp_tag가 있으면 뒤에 추가
+    if args.exp_tag:
+        run_name = f"{run_name}_{args.exp_tag}"
+
+    wandb.init(project='time_series_diffusion', name=run_name)
     wandb.config.update(args)
 
     print('Args in experiment:')
     print(args)
-    
+
     tasks = {
         'long_term_forecast': Exp_Long_Term_Forecast,
         'global_loss': Global_Loss,

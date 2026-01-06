@@ -68,8 +68,8 @@ class Test(object):
                 print(f'Use Multi-GPU: {self.args.devices} (primary cuda:{self.args.gpu})')
             else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(self.args.gpu)
-                device = torch.device(f'cuda:{self.args.gpu}')
-                print(f'Use GPU: cuda:{self.args.gpu}')
+                device = torch.device('cuda:0')  # CUDA_VISIBLE_DEVICES로 제한했으므로 항상 0
+                print(f'Use GPU: cuda:0 (physical GPU: {self.args.gpu})')
         else:
             device = torch.device('cpu')
             print('Use CPU')
@@ -83,6 +83,56 @@ class Test(object):
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)
+
+        # 데이터셋 정보 출력 (디버깅용)
+        if flag == 'train':
+            print(f"\n{'='*60}")
+            print(f"Dataset Loading Information ({flag})")
+            print(f"{'='*60}")
+            print(f"Data type: {self.args.data}")
+            print(f"Root path: {self.args.root_path}")
+            print(f"Data path: {self.args.data_path}")
+            print(f"Features: {self.args.features}")
+            print(f"Target: {self.args.target}")
+            print(f"Seq len: {self.args.seq_len}")
+            print(f"Pred len: {self.args.pred_len}")
+            print(f"Dataset size: {len(data_set)}")
+            print(f"Dataset class: {type(data_set).__name__}")
+
+            # 첫 번째 샘플 확인
+            sample_x, sample_y, _, _ = data_set[0]
+            print(f"Sample X shape: {sample_x.shape}")
+            print(f"Sample Y shape: {sample_y.shape}")
+            print(f"Sample X range: [{sample_x.min():.4f}, {sample_x.max():.4f}]")
+            print(f"Sample Y range: [{sample_y.min():.4f}, {sample_y.max():.4f}]")
+
+            # Scaler 정보 확인
+            if hasattr(data_set, 'scaler'):
+                print(f"\nScaler info:")
+                print(f"  Mean: {data_set.scaler.mean_[0]:.4f}")
+                print(f"  Std:  {data_set.scaler.scale_[0]:.4f}")
+
+            # Alpha grid 정보
+            print(f"\nAlpha grid info:")
+            print(f"  Number of alphas: {len(self.alphas)}")
+            print(f"  Alpha range: [{self.alphas[0]:.4f}, {self.alphas[-1]:.4f}]")
+            print(f"  Alpha interval: {self.args.interval}")
+
+            # Factor 정보 (96의 약수)
+            T = sample_y.shape[0]
+            factors = []
+            for i in range(2, int(T ** 0.5) + 1):
+                if T % i == 0:
+                    factors.append(i)
+                    if i != T // i:
+                        factors.append(T // i)
+            factors = sorted(set(factors))
+            factors = [1] + factors + [T] if T not in factors else [1] + factors
+            print(f"\nPred_len factors (T={T}): {factors}")
+            print(f"Number of kernel sizes: {len(factors)}")
+
+            print(f"{'='*60}\n")
+
         return data_set, data_loader
 
     def _select_optimizer(self):
@@ -263,39 +313,6 @@ class Test(object):
 
 
 
-    # ==== 학습·검증 공용: 스텝 지도 데이터 구성 ====
-    def process_batch(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
-        """
-        EMA(y)에서 y_{alpha_k} -> y_{alpha_{k-1}} 지도 학습용 쌍을 구성.
-        """
-        _, seq_len, feature_dim = batch_x.shape
-        T_pred = batch_y.shape[1]
-
-        batch_x = batch_x.float()
-        batch_y = batch_y.float()
-        batch_x_mark = None if self.args.data in ('PEMS', 'Solar') else (batch_x_mark.float() if batch_x_mark is not None else None)
-        batch_y_mark = None if self.args.data in ('PEMS', 'Solar') else (batch_y_mark.float() if batch_y_mark is not None else None)
-
-        # 과거 마지막 값 + 미래구간 전체에 대해 EMA
-        ema_all, alpha_values = self.compute_ema_sequences(
-            torch.cat([batch_x[:, -1:].contiguous(), batch_y], dim=1)  # (B, 1+T_pred, C)
-        )
-        # t=1..T_pred만 사용
-        ema_all = ema_all[:, :, 1:]  # (B, A, T_pred, C)
-
-        A = self.alphas.numel()
-        K = A - 1  # 단계 수
-
-        # 입력 x를 K번 복제
-        batch_x_rep = batch_x.unsqueeze(1).expand(-1, K, -1, -1).contiguous().view(-1, seq_len, feature_dim).to(self.device)
-        # y_{alpha_k} (이전)와 y_{alpha_{k-1}} (타깃)
-        batch_ema_y_prev = ema_all[:, 1:, :, :].contiguous().view(-1, T_pred, feature_dim).to(self.device)   # (B*K, T_pred, C)
-        batch_ema_y_target = ema_all[:, :-1, :, :].contiguous().view(-1, T_pred, feature_dim).to(self.device) # (B*K, T_pred, C)
-        # α 값도 길이를 K로 맞춰서 전개
-        alpha_values_k = alpha_values[:, 1:].contiguous().view(-1).to(self.device)  # (B*K,)
-
-        return batch_x_rep, batch_x_mark, batch_y_mark, batch_ema_y_prev, batch_ema_y_target, alpha_values_k
-
     # ==== 역방향 복원 샘플링 ====
         # ==== 역방향 복원 샘플링 ====
     def sampling(self, x, x_mark, y_mark, y=None, use_ma_start=0):
@@ -431,54 +448,42 @@ class Test(object):
         except Exception:
             pass
         return fallback
-    
-    def _run_numeric_suffix(self, fallback: str) -> str:
-        """
-        wandb run name(예: 'amber-planet-193')에서
-        맨 뒤 숫자('193')만 떼서 반환.
-        숫자가 없으면 fallback 그대로 사용.
-        """
-        base = None
-        try:
-            if wandb.run is not None:
-                base = (wandb.run.name or wandb.run.id)
-        except Exception:
-            pass
-        if base is None:
-            base = fallback
-
-        m = re.search(r'(\d+)$', str(base))
-        return m.group(1) if m else str(base)
 
     def _fig_root(self, fallback: str) -> str:
         """
-        figs/<fig_tag(optional)>/<numeric_suffix> 까지의 경로를 반환.
-        fig_tag가 없으면 figs/<numeric_suffix> 형태.
+        figs/<fig_tag(optional)>/<run_name> 까지의 경로를 반환.
+        fig_tag가 없으면 figs/<run_name> 형태.
+
+        run_name 예시:
+        - ETTm1_96_S
+        - electricity_192_M_parameter_test
+        - weather_336_S_ablation
         """
-        suffix = self._run_numeric_suffix(fallback)
+        run_name = self._run_name(fallback)
         fig_tag = getattr(self.args, "fig_tag", None)
         if fig_tag:
-            return os.path.join("./figs", fig_tag, suffix)
+            return os.path.join("./figs", fig_tag, run_name)
         else:
-            return os.path.join("./figs", suffix)
+            return os.path.join("./figs", run_name)
 
     # ==== 검증 ====
     def vali(self, vali_data, vali_loader, criterion):
         """
-        검증은 글로벌 복원 손실만 측정해 비용을 줄임.
+        검증은 글로벌 복원 손실만 측정 (standardized space에서 계산).
         """
         total_loss = []
-        
+
         self.model.eval()
-        
+
         with torch.no_grad():
             pbar = tqdm(enumerate(vali_loader), total=len(vali_loader))
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
                 batch_x, batch_y, batch_x_mark, batch_y_mark = self.process_batch_for_test(batch_x, batch_y, batch_x_mark, batch_y_mark)
-                
+
                 start_mode = getattr(self.args, "use_ma_start", 0)
                 pred_y = self.sampling(batch_x, batch_x_mark, batch_y_mark, batch_y, use_ma_start=start_mode)
                 true_y = batch_y.to(self.device)
+
                 loss = criterion(pred_y, true_y)
                 total_loss.append(loss.item())
                 pbar.set_postfix(loss=loss.item())
@@ -491,7 +496,15 @@ class Test(object):
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
 
-        path = os.path.join(self.args.checkpoints, setting)
+        # Checkpoint 경로: setting에 이미 run.id가 포함되어 있으면 (sweep) 그대로 사용
+        # 아니면 (기존 sh) hyperparameter를 붙여서 고유한 경로 생성
+        if '/' in setting:
+            # sweep: setting = "ETTm2_96_96_S/run_id"
+            path = os.path.join(self.args.checkpoints, setting)
+        else:
+            # 기존 sh: hyperparameter 추가
+            hp_suffix = f"_hd{self.args.hidden_dim}_nh{self.args.num_heads}_nb{self.args.num_dit_block}"
+            path = os.path.join(self.args.checkpoints, setting + hp_suffix)
         os.makedirs(path, exist_ok=True)
 
         # 사진경로
@@ -507,50 +520,7 @@ class Test(object):
 
 
         criterion = self._select_criterion()
-        
-        # ==============================================================
-        #  학습 시작 전에: test 샘플 10개 EMA smoothing 전체 시각화
-        # ==============================================================
 
-        # train_data, train_loader = self._get_data(flag='train')
-        # batch_x, batch_y, _, _ = next(iter(train_loader))
-        # batch_x = batch_x[:10].to(self.device)   # (10, T_in, C)
-        # batch_y = batch_y[:10].to(self.device)   # (10, T_out, C)
-
-        # # [past_last, future] 연결
-        # xy = torch.cat([batch_x[:, -1:], batch_y], dim=1)  # (10, 1+T_out, C)
-
-        # # EMA 전체 생성
-        # ema_all, _ = self.compute_ema_sequences(xy)  # (10, A, 1+T_out, C)
-        # ema_all = ema_all[:, :, 1:, :]               # (10, A, T_out, C)
-
-        # B, A, T_pred, C = ema_all.shape
-
-        # fig_root = self._fig_root(setting)
-        # plot_root = os.path.join(fig_root, 'ema_all_init')   # 초기 EMA 시각화 폴더
-        # os.makedirs(plot_root, exist_ok=True)
-
-        # for s in range(B):  # 10개
-        #     sample_dir = os.path.join(plot_root, f'sample{s+1}')
-        #     os.makedirs(sample_dir, exist_ok=True)
-
-        #     true = batch_y[s, :, -1].detach().cpu().numpy()
-
-        #     for idx in range(A):
-        #         alpha = float(self.alphas[idx].item())
-        #         pred_alpha = ema_all[s, idx, :, -1].detach().cpu().numpy()
-
-        #         plt.figure()
-        #         plt.plot(true, label='Original Future')
-        #         plt.plot(pred_alpha, label=f'EMA α={alpha:.2f}')
-        #         plt.legend()
-        #         plt.title(f'[Init EMA] Sample {s+1} (α={alpha:.2f})')
-        #         plt.savefig(os.path.join(sample_dir, f'ema_alpha_{alpha:.2f}.pdf'))
-        #         plt.close()
-
-        # print(">>> 초기 EMA smoothing 10개 시각화 완료")
-        
-        
         # ========================================================
         lambda_traj = getattr(self.args, "lambda_traj", 1.0)
         lambda_end  = getattr(self.args, "lambda_end", 1.0)
@@ -578,13 +548,7 @@ class Test(object):
                 batch_x = batch_x_raw.to(self.device).to(model_dtype)         # (B, T_in, C)
                 batch_y = batch_y_raw.to(self.device).to(model_dtype)         # (B, T_pred, C)
 
-                # === 1) 랜덤 α 선택 =========================================
-                # self.alphas: [0, a1, a2, ..., 1] 길이 A
-                A = self.alphas.numel()
-                start_idx = torch.randint(low=1, high=A, size=(1,), device=self.device).item()  # 1..A-1
-                start_alpha = self.alphas[start_idx].item()
-                
-                # === 2) 해당 α에서의 corrupted 타깃 y_α 만들기 ==============
+                # === 1) EMA 전체 계산 =========================================
                 # 입력: 과거 마지막값 + 미래정답 전체  → EMA 전체 계산
                 ema_all, _ = self.compute_ema_sequences(
                     torch.cat([batch_x[:, -1:].contiguous(), batch_y], dim=1)  # (B, 1+T_pred, C)
@@ -592,6 +556,7 @@ class Test(object):
                 ema_all = ema_all[:, :, 1:]                                    # (B, A, T_pred, C)
                 ema_all = ema_all.to(model_dtype)
 
+                # === 2) 랜덤 α 범위 선택 =========================================
                 A = self.alphas.numel()
                 # 1..A-1 범위에서 2개 랜덤 선택
                 idx1 = torch.randint(1, A, (1,), device=self.device).item()
@@ -745,9 +710,10 @@ class Test(object):
         test_data, test_loader = self._get_data(flag='test')
         if test:
             print('loading model')
-            self.model.load_state_dict(
-                torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth'))
-            )
+            # train과 동일한 경로 구성
+            hp_suffix = f"_hd{self.args.hidden_dim}_nh{self.args.num_heads}_nb{self.args.num_dit_block}"
+            ckpt_path = os.path.join(self.args.checkpoints, setting + hp_suffix, 'checkpoint.pth')
+            self.model.load_state_dict(torch.load(ckpt_path))
 
         preds = []
         trues = []
@@ -899,11 +865,7 @@ class Test(object):
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
         print('test shape:', preds.shape, trues.shape)
 
-        if self.args.data == 'PEMS':
-            B, T, C = preds.shape
-            preds = test_data.inverse_transform(preds.reshape(-1, C)).reshape(B, T, C)
-            trues = test_data.inverse_transform(trues.reshape(-1, C)).reshape(B, T, C)
-
+        # TimeMixer 방식: standardized space에서 메트릭 계산
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
         wandb.log({'test/mse': mse, 'test/mae': mae})

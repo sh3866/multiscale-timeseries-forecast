@@ -1,13 +1,15 @@
 from .Ours import DiT
-from .TimeMixer import TimeMixer
-from .MLP import MLPForecast
-from .RNN import RNNForecast
+from .Ours_CM import DiT_CM
+from .Ours_CATS import DiT_CATS
+from .Ours_TID import DiT_TID
+
+
 
 _model_registry = {
     "Ours": DiT,
-    "TimeMixer": TimeMixer,
-    "MLP": MLPForecast,
-    "RNN": RNNForecast,
+    "Ours_CM": DiT_CM,      # Channel Mixing version for multivariate
+    "Ours_CATS": DiT_CATS,  # CATS (Auxiliary Time Series) for multivariate
+    "Ours_TID": DiT_TID,    # TID (Time Image Decomposition) - Dual-Axis Attention
 }
 
 def get_model(name, args):
