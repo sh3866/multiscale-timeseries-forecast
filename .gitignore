@@ -88,4 +88,4 @@ nohup.out
 # Large dataset folders
 dataset_matsd/
 sweeps/
-scripts_test/
+testscripts/
