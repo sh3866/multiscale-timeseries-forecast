@@ -87,3 +87,4 @@ ehthumbs.db
 # Large dataset folders
 dataset_matsd/
 sweeps/
+scripts_test/
