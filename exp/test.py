@@ -470,8 +470,10 @@ class Test(object):
     def vali(self, vali_data, vali_loader, criterion):
         """
         검증은 글로벌 복원 손실만 측정 (standardized space에서 계산).
+        test와 동일하게 전체 prediction을 모은 후 MSE 계산.
         """
-        total_loss = []
+        preds = []
+        trues = []
 
         self.model.eval()
 
@@ -482,14 +484,17 @@ class Test(object):
 
                 start_mode = getattr(self.args, "use_ma_start", 0)
                 pred_y = self.sampling(batch_x, batch_x_mark, batch_y_mark, batch_y, use_ma_start=start_mode)
-                true_y = batch_y.to(self.device)
 
-                loss = criterion(pred_y, true_y)
-                total_loss.append(loss.item())
-                pbar.set_postfix(loss=loss.item())
-        avg = float(np.mean(total_loss)) if total_loss else 0.0
+                preds.append(pred_y.detach().cpu().numpy())
+                trues.append(batch_y.detach().cpu().numpy())
+
+        # 전체 prediction에 대해 MSE 계산 (test와 동일)
+        preds = np.concatenate(preds, axis=0)
+        trues = np.concatenate(trues, axis=0)
+        mse = np.mean((preds - trues) ** 2)
+
         self.model.train()
-        return avg
+        return mse
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -869,4 +874,83 @@ class Test(object):
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
         wandb.log({'test/mse': mse, 'test/mae': mae})
+
+        # ========== 전체 feature 시각화 (랜덤 샘플) ==========
+        self._visualize_all_features(preds, trues, test_data, test_loader, setting, epoch=epoch)
+
         return
+
+    def _visualize_all_features(self, preds, trues, test_data, test_loader, setting, epoch=None, num_samples=5):
+        """
+        랜덤으로 샘플을 뽑아서 전체 feature를 시각화 (과거 + 미래) - 세로 형식
+        figs/<fig_tag>/<run_name>/all_features/epoch_<N>/ 에 저장
+        """
+        import random
+
+        fig_root = self._fig_root(setting)
+
+        # epoch별 폴더 생성
+        if epoch is not None:
+            all_feat_dir = os.path.join(fig_root, 'all_features', f'epoch_{epoch}')
+        else:
+            all_feat_dir = os.path.join(fig_root, 'all_features')
+        os.makedirs(all_feat_dir, exist_ok=True)
+
+        total_samples = preds.shape[0]
+        num_features = preds.shape[-1]
+        pred_len = preds.shape[1]
+        seq_len = self.args.seq_len
+
+        # 랜덤 샘플 선택
+        sample_indices = random.sample(range(total_samples), min(num_samples, total_samples))
+
+        # 과거 시퀀스를 다시 가져오기 위해 test_loader 순회
+        inputs_list = []
+        with torch.no_grad():
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in test_loader:
+                inputs_list.append(batch_x.numpy())
+        inputs = np.concatenate(inputs_list, axis=0)
+        inputs = inputs.reshape(-1, inputs.shape[-2], inputs.shape[-1])
+
+        for idx in sample_indices:
+            input_seq = inputs[idx]  # (seq_len, num_features) - 과거
+            pred = preds[idx]        # (pred_len, num_features) - 예측
+            true = trues[idx]        # (pred_len, num_features) - 정답
+
+            # 세로로 feature 나열 (1열, num_features행)
+            fig, axes = plt.subplots(num_features, 1, figsize=(12, 2.5 * num_features))
+            if num_features == 1:
+                axes = [axes]
+
+            fig.suptitle(f'Sample {idx} - All Features (Past + Future)', fontsize=14, y=1.02)
+
+            for feat_idx in range(num_features):
+                ax = axes[feat_idx]
+
+                # x축 설정
+                past_x = np.arange(0, seq_len)
+                future_x = np.arange(seq_len, seq_len + pred_len)
+
+                # 과거와 미래를 이어서 하나의 연속된 GT 선으로 그리기
+                full_gt_x = np.concatenate([past_x, future_x])
+                full_gt_y = np.concatenate([input_seq[:, feat_idx], true[:, feat_idx]])
+                ax.plot(full_gt_x, full_gt_y, label='Ground Truth', color='blue', linewidth=1.5)
+
+                # 미래 Prediction (빨간색 점선)
+                ax.plot(future_x, pred[:, feat_idx], label='Prediction', color='red', linestyle='--', linewidth=1.5)
+
+                # 과거/미래 경계선
+                ax.axvline(x=seq_len - 0.5, color='black', linestyle=':', alpha=0.5, label='Forecast Start')
+
+                ax.set_title(f'Channel {feat_idx}', fontsize=10)
+                ax.set_ylabel('Value')
+                if feat_idx == num_features - 1:
+                    ax.set_xlabel('Time')
+                ax.legend(loc='upper right', fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(all_feat_dir, f'sample_{idx}_all_features.png'), dpi=150, bbox_inches='tight')
+            plt.close()
+
+        print(f'Saved {len(sample_indices)} all-features visualization(s) to {all_feat_dir}')

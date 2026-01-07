@@ -234,17 +234,33 @@ class DiT(nn.Module):
         super().__init__()
         self.args = args
 
-        self.x_embedder = nn.Linear(args.feature_dim, args.hidden_dim)
-        self.y_embedder = nn.Linear(args.feature_dim, args.hidden_dim)
+        # channel_independent: 0 = channel-mixing (기존), 1 = channel-independent
+        self.channel_independent = getattr(args, 'channel_independent', 0)
+        self.feature_dim = args.feature_dim
+
+        # Channel-independent면 항상 feature_dim=1로 처리
+        embed_dim = 1 if self.channel_independent else args.feature_dim
+
+        self.x_embedder = nn.Linear(embed_dim, args.hidden_dim)
+        self.y_embedder = nn.Linear(embed_dim, args.hidden_dim)
         self.t_embedder = TimestepEmbedder(args.hidden_dim)
 
         self.blocks = nn.ModuleList([
             DiTBlock(args.hidden_dim, args.num_heads, mlp_ratio=args.mlp_ratio)
             for _ in range(args.num_dit_block)
         ])
-        self.final_layer = FinalLayer(args.hidden_dim, args.feature_dim)
+        self.final_layer = FinalLayer(args.hidden_dim, embed_dim)
 
     def forward(self, x, y, t):
+        B, L_x, F = x.shape
+        L_y = y.shape[1]
+
+        if self.channel_independent and F > 1:
+            # (B, L, F) → (B*F, L, 1): 각 feature를 독립적으로 처리
+            x = x.permute(0, 2, 1).reshape(B * F, L_x, 1)
+            y = y.permute(0, 2, 1).reshape(B * F, L_y, 1)
+            t = t.repeat_interleave(F, dim=0)  # (B,) → (B*F,)
+
         x = self.x_embedder(x)
         y = self.y_embedder(y)
         t = self.t_embedder(t)
@@ -252,4 +268,10 @@ class DiT(nn.Module):
         for blk in self.blocks:
             x = blk(x, y, t)
 
-        return self.final_layer(x, t)
+        out = self.final_layer(x, t)
+
+        if self.channel_independent and F > 1:
+            # (B*F, L, 1) → (B, L, F): 다시 원래 shape으로
+            out = out.reshape(B, F, L_x).permute(0, 2, 1)
+
+        return out

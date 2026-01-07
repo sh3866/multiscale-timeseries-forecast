@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=0
 
 ### Training description
 learning_rate=0.0001
@@ -21,10 +21,13 @@ lambda_mu=0.0
 lambda_traj=1.0
 lambda_end=1.0
 
+### Channel mode: 0=channel-mixing, 1=channel-independent
+channel_independent=0
+
 variate=S
 feature_dim=1
 
-fig_tag="01_04_matsd"
+fig_tag="01_07_newtest"
 exp_tag="matsd"  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
 
 # Array of sequence lengths to test
@@ -61,7 +64,8 @@ for pred_len in "${seq_lengths[@]}"; do
       --lambda_mu $lambda_mu \
       --lambda_traj $lambda_traj \
       --lambda_end $lambda_end \
-      --patience $patience
+      --patience $patience \
+      --channel_independent $channel_independent
 done
 
 echo "================================"

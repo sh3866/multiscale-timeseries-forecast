@@ -53,6 +53,8 @@ def get_args():
     parser.add_argument('--num_heads', type=int, default=4)
     parser.add_argument('--num_dit_block', type=int, default=4)
     parser.add_argument('--mlp_ratio', type=float, default=4.0)
+    parser.add_argument('--channel_independent', type=int, default=0,
+                        help='0: channel-mixing (기존), 1: channel-independent (각 feature 독립 처리)')
 
     # imputation task
     parser.add_argument('--mask_rate', type=float, default=0.125, help='mask ratio')

@@ -21,6 +21,9 @@ lambda_mu=0.0
 lambda_traj=1.0
 lambda_end=1.0
 
+### Channel mode: 0=channel-mixing, 1=channel-independent
+channel_independent=0
+
 variate=S
 feature_dim=1
 
@@ -61,7 +64,8 @@ for pred_len in "${seq_lengths[@]}"; do
       --lambda_mu $lambda_mu \
       --lambda_traj $lambda_traj \
       --lambda_end $lambda_end \
-      --patience $patience
+      --patience $patience \
+      --channel_independent $channel_independent
 done
 
 echo "================================"
