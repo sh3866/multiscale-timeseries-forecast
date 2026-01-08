@@ -272,16 +272,13 @@ class Model(nn.Module):
                 )
 
             # ========== MA-Diffusion Conditioning ==========
-            # y_current를 요약해서 context vector로 만듦 (encoder에 주입용)
-            self.y_ctx_proj = nn.Linear(configs.c_out, configs.d_model)
-
-            # Alpha embedding + FiLM (scale, shift) for encoder conditioning
-            self.alpha_emb = SinusoidalPositionEmbeddings(configs.d_model)
-            self.alpha_mlp = nn.Sequential(
-                nn.Linear(configs.d_model, configs.d_model * 4),
-                nn.GELU(),
-                nn.Linear(configs.d_model * 4, configs.d_model * 2),  # scale + shift
-            )
+            # y_current (1 dim) + alpha (1 dim) → concat to enc_out feature dimension
+            # enc_out: (B, T, d_model) → (B, T, d_model + 2)
+            # projection layer 입력 차원 수정 필요
+            if self.channel_independence == 1:
+                self.ma_projection_layer = nn.Linear(configs.d_model + 2, 1, bias=True)
+            else:
+                self.ma_projection_layer = nn.Linear(configs.d_model + 2, configs.c_out, bias=True)
             # ==============================================
         if self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
             if self.channel_independence == 1:
@@ -296,8 +293,9 @@ class Model(nn.Module):
             self.projection = nn.Linear(
                 configs.d_model * configs.seq_len, configs.num_class)
 
-    def out_projection(self, dec_out, i, out_res):
-        dec_out = self.projection_layer(dec_out)
+    def out_projection(self, dec_out, i, out_res, ma_mode=False):
+        proj_layer = self.ma_projection_layer if ma_mode else self.projection_layer
+        dec_out = proj_layer(dec_out)
         out_res = out_res.permute(0, 2, 1)
         out_res = self.out_res_layers[i](out_res)
         out_res = self.regression_layers[i](out_res).permute(0, 2, 1)
@@ -365,13 +363,19 @@ class Model(nn.Module):
 
         Args:
             x_enc: (B, seq_len, C) - past input
-            y_current: (B, pred_len, C) - current state for residual prediction
+            y_current: (B, pred_len, C) - current state (raw values)
             alpha: (B,) - diffusion step
 
         Returns:
-            If y_current is provided: y_current + delta (residual prediction)
-            Else: direct prediction (original TimeMixer behavior)
+            Direct prediction of next EMA target
         """
+        B_orig = x_enc.size(0)
+        ma_mode = y_current is not None
+
+        # y_current를 multi-scale로 downsampling (나중에 enc_out에 concat용)
+        if ma_mode:
+            y_current_list = self._downsample_y_current(y_current)  # list of (B, T_i, C)
+
         if self.use_future_temporal_feature:
             if self.channel_independence == 1:
                 B, T, N = x_enc.size()
@@ -417,70 +421,86 @@ class Model(nn.Module):
         for i in range(self.layer):
             enc_out_list = self.pdm_blocks[i](enc_out_list)
 
-        # ========== MA-Diffusion Conditioning on enc_out_list ==========
-        # PDM blocks 이후, predictor 이전에 y_current와 alpha를 enc_out에 반영
-        if y_current is not None or alpha is not None:
-            # 옵션 A) y_current를 요약해서 broadcast
-            y_ctx = None
-            if y_current is not None:
-                # y_current: (B, pred_len, C) → mean → (B, C) → proj → (B, d_model)
-                y_ctx = self.y_ctx_proj(y_current.mean(dim=1))  # (B, d_model)
-                if self.channel_independence == 1:
-                    # (B, d_model) → (B*N, 1, d_model) for broadcasting
-                    N = self.configs.c_out
-                    y_ctx = y_ctx.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
-                else:
-                    y_ctx = y_ctx.unsqueeze(1)  # (B, 1, d_model)
-
-            # 옵션 B) alpha는 FiLM으로 enc_out 전체에 걸기
-            scale, shift = None, None
-            if alpha is not None:
-                alpha_emb = self.alpha_emb(alpha)  # (B, d_model)
-                alpha_params = self.alpha_mlp(alpha_emb)  # (B, d_model * 2)
-                scale, shift = alpha_params.chunk(2, dim=-1)  # each (B, d_model)
-                if self.channel_independence == 1:
-                    N = self.configs.c_out
-                    scale = scale.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
-                    shift = shift.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
-                else:
-                    scale = scale.unsqueeze(1)  # (B, 1, d_model)
-                    shift = shift.unsqueeze(1)  # (B, 1, d_model)
-
-            # enc_out_list 각 스케일에 conditioning 적용
+        # ========== MA-Diffusion: y_current + alpha를 enc_out feature dim에 concat ==========
+        if ma_mode:
             conditioned_enc_out_list = []
-            for enc in enc_out_list:
-                # y_current additive
-                if y_ctx is not None:
-                    enc = enc + y_ctx  # broadcast over time dimension
-                # alpha FiLM
-                if scale is not None and shift is not None:
-                    enc = enc * (1 + scale) + shift
-                conditioned_enc_out_list.append(enc)
+            for i, enc_out in enumerate(enc_out_list):
+                # enc_out: (B*N, T_i, d_model) for channel_independence=1
+                T_i = enc_out.shape[1]
+
+                # y_current_list[i]를 channel_independence에 맞게 reshape
+                y_i = y_current_list[i]  # (B, T_i, C)
+                if self.channel_independence == 1:
+                    # (B, T_i, C) → (B*C, T_i, 1) - 각 채널별로 해당 값만
+                    N = self.configs.c_out
+                    y_i = y_i.permute(0, 2, 1).contiguous().reshape(B * N, T_i, 1)
+
+                # alpha: (B,) → (B*N, T_i, 1) 또는 (B, T_i, 1)
+                if alpha is not None:
+                    if self.channel_independence == 1:
+                        alpha_expanded = alpha.unsqueeze(1).unsqueeze(2).repeat(1, N, 1).reshape(B * N, 1, 1)
+                        alpha_expanded = alpha_expanded.expand(-1, T_i, -1)
+                    else:
+                        alpha_expanded = alpha.unsqueeze(1).unsqueeze(2).expand(B, T_i, 1)
+                else:
+                    if self.channel_independence == 1:
+                        alpha_expanded = torch.zeros(B * N, T_i, 1, device=enc_out.device)
+                    else:
+                        alpha_expanded = torch.zeros(B, T_i, 1, device=enc_out.device)
+
+                # concat: (B*N, T_i, d_model) + (B*N, T_i, 1) + (B*N, T_i, 1) → (B*N, T_i, d_model+2)
+                enc_out = torch.cat([enc_out, y_i, alpha_expanded], dim=-1)
+                conditioned_enc_out_list.append(enc_out)
             enc_out_list = conditioned_enc_out_list
-        # ================================================================
+        # ====================================================================================
 
         # Future Multipredictor Mixing as decoder for future
-        dec_out_list = self.future_multi_mixing(B, enc_out_list, x_list)
+        dec_out_list = self.future_multi_mixing(B, enc_out_list, x_list, ma_mode)
 
         dec_out = torch.stack(dec_out_list, dim=-1).sum(-1)
         dec_out = self.normalize_layers[0](dec_out, 'denorm')
 
-        # ========== Residual prediction ==========
-        # TimeMixer outputs full prediction. For MA-Diffusion, we need delta.
-        # delta = prediction - y_current, so y_next = y_current + delta = prediction
-        # But we want the model to learn the residual, so:
-        # output = y_current + (model_output - y_current) when y_current is given
-        # This simplifies to just returning model_output directly.
-        # The residual learning happens through the conditioning, not post-processing.
-
         return dec_out
 
-    def future_multi_mixing(self, B, enc_out_list, x_list):
+    def _downsample_y_current(self, y_current):
+        """
+        y_current를 enc_out_list의 각 scale 길이에 맞게 adaptive pooling.
+
+        Args:
+            y_current: (B, pred_len, C)
+
+        Returns:
+            y_list: list of (B, T_i, C) for each scale
+                - scale 0: seq_len
+                - scale 1: seq_len // 2
+                - scale 2: seq_len // 4
+                - ...
+        """
+        y_list = []
+
+        # (B, pred_len, C) → (B, C, pred_len) for pooling
+        y = y_current.permute(0, 2, 1)
+
+        for i in range(self.configs.down_sampling_layers + 1):
+            target_len = self.configs.seq_len // (self.configs.down_sampling_window ** i)
+            # AdaptiveAvgPool1d로 target_len에 맞게 축소
+            pool = torch.nn.AdaptiveAvgPool1d(target_len)
+            y_pooled = pool(y)  # (B, C, target_len)
+            y_list.append(y_pooled.permute(0, 2, 1))  # (B, target_len, C)
+
+        return y_list
+
+    def future_multi_mixing(self, B, enc_out_list, x_list, ma_mode=False):
         """
         Future Multipredictor Mixing.
-        MA-Diffusion conditioning은 이미 enc_out_list에 적용되어 있음.
+
+        Args:
+            ma_mode: MA-Diffusion 모드 여부 (True면 enc_out이 d_model+2 차원)
         """
         dec_out_list = []
+
+        # MA 모드일 때는 ma_projection_layer 사용 (입력 차원 d_model+2)
+        proj_layer = self.ma_projection_layer if ma_mode else self.projection_layer
 
         if self.channel_independence == 1:
             x_list = x_list[0]
@@ -490,9 +510,9 @@ class Model(nn.Module):
 
                 if self.use_future_temporal_feature:
                     dec_out = dec_out + self.x_mark_dec
-                    dec_out = self.projection_layer(dec_out)
+                    dec_out = proj_layer(dec_out)
                 else:
-                    dec_out = self.projection_layer(dec_out)
+                    dec_out = proj_layer(dec_out)
                 dec_out = dec_out.reshape(B, self.configs.c_out, self.pred_len).permute(0, 2, 1).contiguous()
                 dec_out_list.append(dec_out)
 
@@ -501,7 +521,7 @@ class Model(nn.Module):
                 dec_out = self.predict_layers[i](enc_out.permute(0, 2, 1)).permute(
                     0, 2, 1)  # align temporal dimension
 
-                dec_out = self.out_projection(dec_out, i, out_res)
+                dec_out = self.out_projection(dec_out, i, out_res, ma_mode)
                 dec_out_list.append(dec_out)
 
         return dec_out_list
