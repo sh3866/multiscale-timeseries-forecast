@@ -272,10 +272,10 @@ class Model(nn.Module):
                 )
 
             # ========== MA-Diffusion Conditioning ==========
-            # y_current를 d_model로 projection
-            self.y_proj = nn.Linear(configs.c_out, configs.d_model)
+            # y_current를 요약해서 context vector로 만듦 (encoder에 주입용)
+            self.y_ctx_proj = nn.Linear(configs.c_out, configs.d_model)
 
-            # Alpha embedding + FiLM (scale, shift)
+            # Alpha embedding + FiLM (scale, shift) for encoder conditioning
             self.alpha_emb = SinusoidalPositionEmbeddings(configs.d_model)
             self.alpha_mlp = nn.Sequential(
                 nn.Linear(configs.d_model, configs.d_model * 4),
@@ -417,8 +417,50 @@ class Model(nn.Module):
         for i in range(self.layer):
             enc_out_list = self.pdm_blocks[i](enc_out_list)
 
-        # Future Multipredictor Mixing as decoder for future (with conditioning)
-        dec_out_list = self.future_multi_mixing(B, enc_out_list, x_list, y_cond=y_current, alpha_cond=alpha)
+        # ========== MA-Diffusion Conditioning on enc_out_list ==========
+        # PDM blocks 이후, predictor 이전에 y_current와 alpha를 enc_out에 반영
+        if y_current is not None or alpha is not None:
+            # 옵션 A) y_current를 요약해서 broadcast
+            y_ctx = None
+            if y_current is not None:
+                # y_current: (B, pred_len, C) → mean → (B, C) → proj → (B, d_model)
+                y_ctx = self.y_ctx_proj(y_current.mean(dim=1))  # (B, d_model)
+                if self.channel_independence == 1:
+                    # (B, d_model) → (B*N, 1, d_model) for broadcasting
+                    N = self.configs.c_out
+                    y_ctx = y_ctx.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
+                else:
+                    y_ctx = y_ctx.unsqueeze(1)  # (B, 1, d_model)
+
+            # 옵션 B) alpha는 FiLM으로 enc_out 전체에 걸기
+            scale, shift = None, None
+            if alpha is not None:
+                alpha_emb = self.alpha_emb(alpha)  # (B, d_model)
+                alpha_params = self.alpha_mlp(alpha_emb)  # (B, d_model * 2)
+                scale, shift = alpha_params.chunk(2, dim=-1)  # each (B, d_model)
+                if self.channel_independence == 1:
+                    N = self.configs.c_out
+                    scale = scale.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
+                    shift = shift.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
+                else:
+                    scale = scale.unsqueeze(1)  # (B, 1, d_model)
+                    shift = shift.unsqueeze(1)  # (B, 1, d_model)
+
+            # enc_out_list 각 스케일에 conditioning 적용
+            conditioned_enc_out_list = []
+            for enc in enc_out_list:
+                # y_current additive
+                if y_ctx is not None:
+                    enc = enc + y_ctx  # broadcast over time dimension
+                # alpha FiLM
+                if scale is not None and shift is not None:
+                    enc = enc * (1 + scale) + shift
+                conditioned_enc_out_list.append(enc)
+            enc_out_list = conditioned_enc_out_list
+        # ================================================================
+
+        # Future Multipredictor Mixing as decoder for future
+        dec_out_list = self.future_multi_mixing(B, enc_out_list, x_list)
 
         dec_out = torch.stack(dec_out_list, dim=-1).sum(-1)
         dec_out = self.normalize_layers[0](dec_out, 'denorm')
@@ -433,49 +475,18 @@ class Model(nn.Module):
 
         return dec_out
 
-    def future_multi_mixing(self, B, enc_out_list, x_list, y_cond=None, alpha_cond=None):
+    def future_multi_mixing(self, B, enc_out_list, x_list):
         """
-        Future Multipredictor Mixing with optional MA-Diffusion conditioning.
-
-        Args:
-            y_cond: (B, pred_len, C) - y_current for additive conditioning
-            alpha_cond: (B,) - alpha for FiLM conditioning
+        Future Multipredictor Mixing.
+        MA-Diffusion conditioning은 이미 enc_out_list에 적용되어 있음.
         """
         dec_out_list = []
-
-        # ========== Alpha FiLM parameters ==========
-        scale, shift = None, None
-        if alpha_cond is not None:
-            alpha_emb = self.alpha_emb(alpha_cond)  # (B, d_model)
-            alpha_params = self.alpha_mlp(alpha_emb)  # (B, d_model * 2)
-            scale, shift = alpha_params.chunk(2, dim=-1)  # each (B, d_model)
-
-        # ========== y_current projection ==========
-        y_emb = None
-        if y_cond is not None:
-            y_emb = self.y_proj(y_cond)  # (B, pred_len, d_model)
 
         if self.channel_independence == 1:
             x_list = x_list[0]
             for i, enc_out in zip(range(len(x_list)), enc_out_list):
                 dec_out = self.predict_layers[i](enc_out.permute(0, 2, 1)).permute(
                     0, 2, 1)  # align temporal dimension
-
-                # ===== y_current additive conditioning =====
-                if y_emb is not None:
-                    # channel_independence=1: dec_out is (B*N, pred_len, d_model)
-                    # y_emb is (B, pred_len, d_model), need to repeat for N channels
-                    N = self.configs.c_out
-                    y_emb_expanded = y_emb.unsqueeze(1).repeat(1, N, 1, 1).reshape(B * N, self.pred_len, -1)
-                    dec_out = dec_out + y_emb_expanded
-
-                # ===== Alpha FiLM conditioning =====
-                if scale is not None and shift is not None:
-                    # scale, shift: (B, d_model) -> (B*N, 1, d_model)
-                    N = self.configs.c_out
-                    scale_exp = scale.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
-                    shift_exp = shift.unsqueeze(1).repeat(1, N, 1).reshape(B * N, 1, -1)
-                    dec_out = dec_out * (1 + scale_exp) + shift_exp
 
                 if self.use_future_temporal_feature:
                     dec_out = dec_out + self.x_mark_dec
@@ -489,15 +500,6 @@ class Model(nn.Module):
             for i, enc_out, out_res in zip(range(len(x_list[0])), enc_out_list, x_list[1]):
                 dec_out = self.predict_layers[i](enc_out.permute(0, 2, 1)).permute(
                     0, 2, 1)  # align temporal dimension
-
-                # ===== y_current additive conditioning =====
-                if y_emb is not None:
-                    dec_out = dec_out + y_emb
-
-                # ===== Alpha FiLM conditioning =====
-                if scale is not None and shift is not None:
-                    # scale, shift: (B, d_model) -> (B, 1, d_model)
-                    dec_out = dec_out * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
                 dec_out = self.out_projection(dec_out, i, out_res)
                 dec_out_list.append(dec_out)

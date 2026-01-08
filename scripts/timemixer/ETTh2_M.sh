@@ -35,7 +35,7 @@ enc_in=7
 c_out=7
 
 fig_tag="01_09_timemixer"
-exp_tag="first"
+exp_tag="second"
 
 # Array of prediction lengths to test
 pred_lengths=(96)
