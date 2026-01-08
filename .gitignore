@@ -62,7 +62,8 @@ tb_logs/
 # Model checkpoints and outputs
 checkpoints/
 checkpoints_*/
-models/
+models/__pycache__
+models/beforebest
 saved_models/
 outputs/
 exp_original/

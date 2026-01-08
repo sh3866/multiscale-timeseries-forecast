@@ -22,13 +22,13 @@ lambda_traj=1.0
 lambda_end=1.0
 
 ### Channel mode: 0=channel-mixing, 1=channel-independent
-channel_independent=1
+channel_independent=0
 
 variate=M
 feature_dim=21
 
 fig_tag="01_08_newmodel"
-exp_tag=""  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
+exp_tag="channelmixing"  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
 
 # Array of prediction lengths to test
 seq_lengths=(96)

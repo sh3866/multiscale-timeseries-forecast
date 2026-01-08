@@ -1,4 +1,4 @@
-method: bayes
+method: grid
 metric:
   name: test/mse
   goal: minimize
@@ -6,7 +6,7 @@ metric:
 parameters:
   # ========== Sweep Parameters (하이퍼파라미터 탐색) ==========
   hidden_dim:
-    values: [32, 64, 128]
+    values: [64, 128, 256]
 
   num_heads:
     values: [4, 8, 16]
@@ -36,7 +36,7 @@ parameters:
   is_training:
     value: 1
   model:
-    value: 'Ours'
+    value: 'Ours_new'
   seed:
     value: 0
 
@@ -73,6 +73,10 @@ parameters:
     value: 0
   lambda_mu:
     value: 0.0
+
+  # Channel mode (will be overridden by sweep_agent.py based on variate)
+  channel_independent:
+    value: 1
 
   # Data loader
   num_workers:

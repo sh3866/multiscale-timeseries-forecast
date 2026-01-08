@@ -56,6 +56,22 @@ def get_args():
     parser.add_argument('--channel_independent', type=int, default=0,
                         help='0: channel-mixing (기존), 1: channel-independent (각 feature 독립 처리)')
 
+    # TimeMixer specific
+    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
+    parser.add_argument('--d_model', type=int, default=16, help='dimension of model')
+    parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
+    parser.add_argument('--enc_in', type=int, default=7, help='encoder input size')
+    parser.add_argument('--c_out', type=int, default=7, help='output size')
+    parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
+    parser.add_argument('--down_sampling_layers', type=int, default=3, help='num of down sampling layers')
+    parser.add_argument('--down_sampling_window', type=int, default=2, help='down sampling window size')
+    parser.add_argument('--down_sampling_method', type=str, default='avg', help='down sampling method: avg, max, conv')
+    parser.add_argument('--use_norm', type=int, default=1, help='whether to use normalize')
+    parser.add_argument('--decomp_method', type=str, default='moving_avg', help='decomposition method: moving_avg, dft_decomp')
+    parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
+    parser.add_argument('--top_k', type=int, default=5, help='top k freq for DFT decomposition')
+    parser.add_argument('--use_future_temporal_feature', type=int, default=0, help='whether to use future temporal feature')
+
     # imputation task
     parser.add_argument('--mask_rate', type=float, default=0.125, help='mask ratio')
 
@@ -114,6 +130,9 @@ def get_args():
 if __name__ == '__main__':
     args = get_args()
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
+
+    # TimeMixer compatibility: channel_independent -> channel_independence
+    args.channel_independence = getattr(args, 'channel_independent', 0)
 
     set_seed(args.seed)
 

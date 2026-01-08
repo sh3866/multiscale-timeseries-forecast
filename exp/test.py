@@ -136,7 +136,7 @@ class Test(object):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return optim.SGD(self.model.parameters(), lr=self.args.learning_rate, momentum=0.9)
 
     def _select_criterion(self):
         # 데이터셋 명시보다 loss 플래그를 신뢰
@@ -521,7 +521,7 @@ class Test(object):
 
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        model_optim = optim.SGD(self.model.parameters(), lr=self.args.learning_rate, momentum=0.9)
 
 
         criterion = self._select_criterion()
@@ -561,57 +561,40 @@ class Test(object):
                 ema_all = ema_all[:, :, 1:]                                    # (B, A, T_pred, C)
                 ema_all = ema_all.to(model_dtype)
 
-                # === 2) 랜덤 α 범위 선택 =========================================
-                A = self.alphas.numel()
-                # 1..A-1 범위에서 2개 랜덤 선택
-                idx1 = torch.randint(1, A, (1,), device=self.device).item()
-                idx2 = torch.randint(1, A, (1,), device=self.device).item()
+                # === 2) 항상 α=1 (최대 smoothing)에서 시작 → α=0 (원본)까지 ===
+                A = self.alphas.numel()  # alpha grid 크기
+                start_idx = A - 1        # α=1 (가장 smooth)
+                end_idx = 0              # α=0 (원본 GT)
 
-                # 큰 쪽이 start / 작은 쪽이 end
-                start_idx = max(idx1, idx2)
-                end_idx = min(idx1, idx2)
+                # 시작 상태: α=1의 EMA (상수에 가까운 값)
+                output_t = ema_all[:, start_idx, :, :]  # (B, T_pred, C)
 
-                # 최소 1차이는 나게 하기 (동일 인덱스 방지)
-                if start_idx == end_idx:
-                    if start_idx < A-1:
-                        start_idx += 1
-                    else:
-                        end_idx -= 1
-
-                # teacher에서 start step 상태 (y_{alpha_start})
-                y_alpha = ema_all[:, start_idx, :, :]                          # (B, T_pred, C)
-
-                # === 3) start_idx → 0 까지 step-wise trajectory 학습 ============
-
-                output_t = y_alpha  # 초기 상태: teacher EMA at start_idx
-                traj_loss = 0.0
+                # === 3) α=1 → α=0 까지 iterative + traj_loss (detach) ===
+                traj_loss = torch.tensor(0.0, device=self.device, dtype=model_dtype)
                 num_traj_steps = 0
 
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    # === 2) start_idx → end_idx+1 까지만 반복 ===
                     for alpha_idx in range(start_idx, end_idx, -1):
                         a_val = self.alphas[alpha_idx].to(self.device).to(model_dtype)
                         a_exp = a_val.expand(batch_x.shape[0])
 
-                        # predict α_{k-1}
+                        # 모델 예측
                         output_t = self.model(output_t, batch_x, a_exp)
 
-                        # teacher EMA target
-                        teacher_next = ema_all[:, alpha_idx - 1, :, :]
-                        step_loss = criterion(output_t, teacher_next)
-                        traj_loss += step_loss
+                        # Traj Loss: 현재 예측 vs 다음 alpha의 EMA 정답
+                        target_ema = ema_all[:, alpha_idx - 1, :, :]
+                        traj_loss = traj_loss + criterion(output_t, target_ema)
                         num_traj_steps += 1
 
-                    if num_traj_steps > 0:
-                        traj_loss /= num_traj_steps
+                        # 다음 스텝으로 넘어갈 때 gradient 끊기 (detach)
+                        output_t = output_t.detach()
 
-                    # === 3) end loss를 "end_idx" 에서의 teacher EMA 또는 GT 비교로 선택 ===
-                    if end_idx == 0:
-                        # end_idx = 0 → 진짜 Ground Truth 비교
-                        end_loss = criterion(output_t, batch_y)
-                    else:
-                        # 중간 end이면 Teacher EMA 비교
-                        end_loss = criterion(output_t, ema_all[:, end_idx, :, :])
+                    # Traj Loss 평균
+                    if num_traj_steps > 0:
+                        traj_loss = traj_loss / num_traj_steps
+
+                    # End Loss: 최종 예측 vs 원본 GT (α=0)
+                    end_loss = criterion(output_t, batch_y)
 
                     # loss = lambda_traj * traj_loss + lambda_end * end_loss
                     
@@ -715,9 +698,14 @@ class Test(object):
         test_data, test_loader = self._get_data(flag='test')
         if test:
             print('loading model')
-            # train과 동일한 경로 구성
-            hp_suffix = f"_hd{self.args.hidden_dim}_nh{self.args.num_heads}_nb{self.args.num_dit_block}"
-            ckpt_path = os.path.join(self.args.checkpoints, setting + hp_suffix, 'checkpoint.pth')
+            # train과 동일한 경로 구성: sweep vs 기존 sh 분기
+            if '/' in setting:
+                # sweep: setting = "ETTm2_96_96_S/run_id"
+                ckpt_path = os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')
+            else:
+                # 기존 sh: hyperparameter 추가
+                hp_suffix = f"_hd{self.args.hidden_dim}_nh{self.args.num_heads}_nb{self.args.num_dit_block}"
+                ckpt_path = os.path.join(self.args.checkpoints, setting + hp_suffix, 'checkpoint.pth')
             self.model.load_state_dict(torch.load(ckpt_path))
 
         preds = []
@@ -878,7 +866,125 @@ class Test(object):
         # ========== 전체 feature 시각화 (랜덤 샘플) ==========
         self._visualize_all_features(preds, trues, test_data, test_loader, setting, epoch=epoch)
 
+        # ================================================================================
+        # [Alpha-step별 MSE 분석] - 주석 해제하면 각 스텝별 MSE 계산 및 막대그래프 저장
+        # 시간이 오래 걸릴 수 있음 (전체 test set에 대해 모든 중간 스텝 계산)
+        # ================================================================================
+        self._compute_alpha_step_mse(test_data, test_loader, setting, epoch=epoch)
+        # ================================================================================
+
         return
+
+    def _compute_alpha_step_mse(self, test_data, test_loader, setting, epoch=None):
+        """
+        각 알파 스텝별로 MSE를 계산하고 막대그래프로 시각화.
+        - step k에서의 예측값 vs 해당 alpha에 맞는 EMA 정답
+        - 최종 step에서는 원본 GT와 비교
+        """
+        print("\n[Alpha-step MSE Analysis] Computing per-step MSE...")
+
+        fig_root = self._fig_root(setting)
+        alpha_mse_dir = os.path.join(fig_root, 'alpha_mse')
+        os.makedirs(alpha_mse_dir, exist_ok=True)
+
+        alpha_values_desc = self._alpha_steps_desc()  # Tensor (K,) - 내림차순
+        alpha_values_desc_np = alpha_values_desc.detach().cpu().numpy()
+        num_steps = len(alpha_values_desc_np)
+
+        # 각 스텝별 MSE 누적
+        step_mse_sum = np.zeros(num_steps)
+        step_count = 0
+
+        model_dtype = next(self.model.parameters()).dtype
+        start_mode = getattr(self.args, "use_ma_start", 0)
+
+        self.model.eval()
+        with torch.no_grad():
+            pbar = tqdm(enumerate(test_loader), total=len(test_loader), desc="Alpha MSE")
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in pbar:
+                batch_x, batch_y, batch_x_mark, batch_y_mark = \
+                    self.process_batch_for_test(batch_x, batch_y, batch_x_mark, batch_y_mark)
+
+                B = batch_x.shape[0]
+
+                # EMA 정답 계산: (B, A, T_pred, C)
+                ema_input = torch.cat([batch_x[:, -1:].contiguous(), batch_y], dim=1)
+                ema_all, _ = self.compute_ema_sequences(ema_input)
+                ema_all = ema_all[:, :, 1:].to(model_dtype)  # (B, A, T_pred, C)
+
+                # 중간 스텝 예측값 가져오기: (B, K, T_pred, C)
+                preds_all = self.sampling_with_intermediates_tensor(
+                    batch_x, batch_x_mark, batch_y_mark,
+                    y=batch_y, use_ma_start=start_mode,
+                    return_init=False
+                )
+
+                # 각 스텝별 MSE 계산
+                for k in range(num_steps):
+                    pred_k = preds_all[:, k, :, :].to(self.device)  # (B, T_pred, C)
+
+                    # 마지막 스텝 (alpha → 0)은 원본 GT와 비교
+                    if k == num_steps - 1:
+                        target_k = batch_y.to(self.device)  # (B, T_pred, C)
+                    else:
+                        # 중간 스텝은 해당 alpha의 EMA 정답과 비교
+                        # alpha_values_desc[k]에 해당하는 EMA index 찾기
+                        alpha_val = alpha_values_desc[k].item()
+                        # self.alphas에서 가장 가까운 index
+                        alpha_idx = (self.alphas - alpha_val).abs().argmin().item()
+                        # 다음 스텝 (더 작은 alpha)의 EMA가 정답
+                        target_alpha_idx = max(0, alpha_idx - 1)
+                        target_k = ema_all[:, target_alpha_idx, :, :].to(self.device)
+
+                    mse_k = ((pred_k - target_k) ** 2).mean().item()
+                    step_mse_sum[k] += mse_k * B
+
+                step_count += B
+
+        # 평균 MSE 계산
+        step_mse_avg = step_mse_sum / step_count
+
+        # 로그 출력
+        print("\n" + "=" * 60)
+        print("[Alpha-step MSE Results]")
+        print("=" * 60)
+        for k in range(num_steps):
+            alpha_val = alpha_values_desc_np[k]
+            target_desc = "GT (original)" if k == num_steps - 1 else f"EMA(α≈{alpha_val - self.args.interval:.2f})"
+            print(f"  Step {k+1:2d} (α={alpha_val:.3f}) → {target_desc}: MSE = {step_mse_avg[k]:.6f}")
+        print("=" * 60 + "\n")
+
+        # 막대그래프 저장 (wandb에는 test/mse만 로깅, 여기서는 그래프만)
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        x_labels = [f"Step {k+1}\n(α={alpha_values_desc_np[k]:.2f})" for k in range(num_steps)]
+        colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, num_steps))  # 빨강→초록 그라데이션
+
+        bars = ax.bar(range(num_steps), step_mse_avg, color=colors, edgecolor='black', linewidth=0.5)
+
+        ax.set_xlabel('Diffusion Step (α decreasing →)', fontsize=12)
+        ax.set_ylabel('MSE', fontsize=12)
+        ax.set_title(f'Per-Step MSE Analysis (Epoch {epoch})' if epoch is not None else 'Per-Step MSE Analysis', fontsize=14)
+        ax.set_xticks(range(num_steps))
+        ax.set_xticklabels(x_labels, fontsize=8, rotation=45, ha='right')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        # 각 막대 위에 값 표시
+        for bar, mse_val in zip(bars, step_mse_avg):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f'{mse_val:.4f}', ha='center', va='bottom', fontsize=7)
+
+        plt.tight_layout()
+
+        # epoch별로 파일명 구분
+        if epoch is not None:
+            fname = f'alpha_step_mse_epoch_{epoch}.png'
+        else:
+            fname = 'alpha_step_mse.png'
+        plt.savefig(os.path.join(alpha_mse_dir, fname), dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"Saved alpha-step MSE bar chart to {os.path.join(alpha_mse_dir, fname)}")
 
     def _visualize_all_features(self, preds, trues, test_data, test_loader, setting, epoch=None, num_samples=5):
         """

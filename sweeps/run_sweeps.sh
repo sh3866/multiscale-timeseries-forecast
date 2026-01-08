@@ -27,7 +27,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 # ========== EDIT HERE: Set your sweep ID ==========
-SWEEP_ID="sunghyunchoi-postech/time_series_forecasting/cvt7jqlu"
+SWEEP_ID="sunghyunchoi-postech/time_series_forecasting/8848oaqx"
 # Example: SWEEP_ID="sunghyunchoi-postech/time_series_forecasting/abc123"
 
 if [ "$SWEEP_ID" == "YOUR_SWEEP_ID_HERE" ]; then

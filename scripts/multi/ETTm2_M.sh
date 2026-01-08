@@ -9,7 +9,7 @@ train_epochs=100
 patience=100
 
 ### Model description
-model_name=Ours_new
+model_name=Ours
 interval=0.1
 hidden_dim=128
 num_heads=8
@@ -27,8 +27,8 @@ channel_independent=1
 variate=M
 feature_dim=7
 
-fig_tag="01_08_newmodel"
-exp_tag=""  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
+fig_tag="01_08_alphaMSE"
+exp_tag="alphaMSE"  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
 
 # Array of prediction lengths to test
 seq_lengths=(96)

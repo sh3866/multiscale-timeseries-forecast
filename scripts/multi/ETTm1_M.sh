@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=1
 
 ### Training description
 learning_rate=0.0001
@@ -27,8 +27,8 @@ channel_independent=1
 variate=M
 feature_dim=7
 
-fig_tag="01_08_newmodel"
-exp_tag=""  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
+fig_tag="01_08_alphaMSE"
+exp_tag="alphaMSE"  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
 
 # Array of prediction lengths to test
 seq_lengths=(96)

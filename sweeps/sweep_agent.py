@@ -95,6 +95,9 @@ def train():
         args.feature_dim = dataset_cfg['feature_dim']
         args.features = variate
 
+        # Channel independent: 0 for univariate (S), 1 for multivariate (M)
+        args.channel_independent = 1 if variate == 'M' else 0
+
         # GPU settings
         args.use_gpu = True
         args.gpu = GPU_NUMBER

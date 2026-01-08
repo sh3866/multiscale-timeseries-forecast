@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=7
 
 ### Training description
 learning_rate=0.0001
@@ -9,7 +9,7 @@ train_epochs=100
 patience=100
 
 ### Model description
-model_name=Ours_new
+model_name=TimeMixer_MA
 interval=0.1
 hidden_dim=128
 num_heads=8
@@ -19,7 +19,7 @@ num_dit_block=4
 use_ma_start=0
 lambda_mu=0.0
 lambda_traj=1.0
-lambda_end=1.0
+lambda_end=0.0
 
 ### Channel mode: 0=channel-mixing, 1=channel-independent
 channel_independent=1
@@ -27,8 +27,8 @@ channel_independent=1
 variate=M
 feature_dim=7
 
-fig_tag="01_08_newmodel"
-exp_tag=""  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
+fig_tag="01_09_timemixer"
+exp_tag="first"  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
 
 # Array of prediction lengths to test
 seq_lengths=(96)
