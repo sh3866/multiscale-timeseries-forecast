@@ -1,19 +1,25 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=2
 
 ### Training description
-learning_rate=0.001
-batch_size=64
+learning_rate=0.01
+batch_size=16
 train_epochs=100
 patience=100
 
-### Model description
-model_name=Ours
+### Model description (TimeMixer specific)
+model_name=TimeMixer_MA
+seq_len=96
+e_layers=2
+d_model=16
+d_ff=32
+down_sampling_layers=3
+down_sampling_window=2
+down_sampling_method=avg
+
+### MA-Diffusion specific
 interval=0.1
-hidden_dim=128
-num_heads=4
-num_dit_block=2
 
 ### Loss configuration
 use_ma_start=0
@@ -25,39 +31,44 @@ lambda_end=0.0
 channel_independent=1
 
 variate=M
-feature_dim=7
+enc_in=862
+c_out=862
 
-fig_tag="01_09_batchtest"
-exp_tag=""  # 추가 태그 (예: parameter_test, ablation 등) - 비워두면 기본값
+fig_tag="01_09_timemixer"
+exp_tag=""
 
 # Array of prediction lengths to test
-seq_lengths=(96)
+pred_lengths=(96)
 
 echo "================================"
-echo "Starting ETTh2 (Multivariate) experiments"
+echo "Starting traffic (Multivariate) TimeMixer_MA experiments"
 echo "================================"
-for pred_len in "${seq_lengths[@]}"; do
-    echo "Running ETTh2 with pred_len=$pred_len"
+for pred_len in "${pred_lengths[@]}"; do
+    echo "Running traffic with pred_len=$pred_len"
     python -u run.py \
       --task_name test \
       --is_training 1 \
-      --root_path ./dataset/ETT-small/ \
-      --data_path ETTh2.csv \
-      --model_id ETTh2_96_${pred_len}_${variate} \
+      --root_path ./dataset/traffic/ \
+      --data_path traffic.csv \
+      --model_id traffic_${seq_len}_${pred_len}_${variate} \
       --model $model_name \
       --train_epochs $train_epochs \
-      --data ETTh2 \
+      --data custom \
       --features $variate \
-      --seq_len 96 \
+      --seq_len $seq_len \
       --label_len 0 \
       --pred_len $pred_len \
-      --feature_dim $feature_dim \
+      --e_layers $e_layers \
+      --enc_in $enc_in \
+      --c_out $c_out \
+      --d_model $d_model \
+      --d_ff $d_ff \
+      --down_sampling_layers $down_sampling_layers \
+      --down_sampling_window $down_sampling_window \
+      --down_sampling_method $down_sampling_method \
       --batch_size $batch_size \
       --learning_rate $learning_rate \
       --interval $interval \
-      --hidden_dim $hidden_dim \
-      --num_heads $num_heads \
-      --num_dit_block $num_dit_block \
       --fig_tag $fig_tag \
       --exp_tag "$exp_tag" \
       --use_ma_start $use_ma_start \
@@ -69,5 +80,5 @@ for pred_len in "${seq_lengths[@]}"; do
 done
 
 echo "================================"
-echo "ETTh2 (Multivariate) experiments completed!"
+echo "traffic (Multivariate) TimeMixer_MA experiments completed!"
 echo "================================"

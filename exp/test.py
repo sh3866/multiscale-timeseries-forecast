@@ -521,7 +521,7 @@ class Test(object):
 
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
         
-        model_optim = optim.SGD(self.model.parameters(), lr=self.args.learning_rate, momentum=0.9)
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
 
         criterion = self._select_criterion()
@@ -561,40 +561,65 @@ class Test(object):
                 ema_all = ema_all[:, :, 1:]                                    # (B, A, T_pred, C)
                 ema_all = ema_all.to(model_dtype)
 
-                # === 2) 항상 α=1 (최대 smoothing)에서 시작 → α=0 (원본)까지 ===
+                # === 2) Random two-step loss ===================================
+                # 랜덤으로 start_idx, end_idx 선택 (start_idx > end_idx)
+                # start_idx: 큰 alpha (smooth), end_idx: 작은 alpha (원본에 가까움)
                 A = self.alphas.numel()  # alpha grid 크기
-                start_idx = A - 1        # α=1 (가장 smooth)
-                end_idx = 0              # α=0 (원본 GT)
 
-                # 시작 상태: α=1의 EMA (상수에 가까운 값)
-                output_t = ema_all[:, start_idx, :, :]  # (B, T_pred, C)
+                # 최소 1스텝 이상의 간격 보장: start_idx ∈ [1, A-1], end_idx ∈ [0, start_idx-1]
+                start_idx = torch.randint(1, A, (1,)).item()
+                end_idx = torch.randint(0, start_idx, (1,)).item()
 
-                # === 3) α=1 → α=0 까지 iterative + traj_loss (detach) ===
+                num_steps = start_idx - end_idx  # 복원해야 할 스텝 수
+
+                # 시작 상태: start_idx의 EMA 정답
+                output_t = ema_all[:, start_idx, :, :].clone()  # (B, T_pred, C)
+
+                # 정답: end_idx의 EMA (end_idx=0이면 원본 GT)
+                if end_idx == 0:
+                    target_end = batch_y  # 원본 GT
+                else:
+                    target_end = ema_all[:, end_idx, :, :]
+
+                # === 3) Traj Loss: 각 스텝 detach로 끊어서 독립 학습 ===
                 traj_loss = torch.tensor(0.0, device=self.device, dtype=model_dtype)
                 num_traj_steps = 0
 
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    # Traj Loss 계산 (detach로 각 스텝 독립)
+                    output_traj = ema_all[:, start_idx, :, :].clone()  # 시작점
                     for alpha_idx in range(start_idx, end_idx, -1):
                         a_val = self.alphas[alpha_idx].to(self.device).to(model_dtype)
                         a_exp = a_val.expand(batch_x.shape[0])
 
                         # 모델 예측
-                        output_t = self.model(output_t, batch_x, a_exp)
+                        output_traj = self.model(output_traj, batch_x, a_exp)
 
                         # Traj Loss: 현재 예측 vs 다음 alpha의 EMA 정답
-                        target_ema = ema_all[:, alpha_idx - 1, :, :]
-                        traj_loss = traj_loss + criterion(output_t, target_ema)
+                        if alpha_idx - 1 == 0:
+                            target_ema = batch_y  # 원본 GT
+                        else:
+                            target_ema = ema_all[:, alpha_idx - 1, :, :]
+                        traj_loss = traj_loss + criterion(output_traj, target_ema)
                         num_traj_steps += 1
 
-                        # 다음 스텝으로 넘어갈 때 gradient 끊기 (detach)
-                        output_t = output_t.detach()
+                        # 다음 스텝으로 넘어갈 때 gradient 끊기
+                        output_traj = output_traj.detach()
 
                     # Traj Loss 평균
                     if num_traj_steps > 0:
                         traj_loss = traj_loss / num_traj_steps
 
-                    # End Loss: 최종 예측 vs 원본 GT (α=0)
-                    end_loss = criterion(output_t, batch_y)
+                    # === 4) End Loss: 전체 trajectory gradient 흐름 (detach 없음) ===
+                    output_end = ema_all[:, start_idx, :, :].clone()  # 시작점 (새로 시작)
+                    for alpha_idx in range(start_idx, end_idx, -1):
+                        a_val = self.alphas[alpha_idx].to(self.device).to(model_dtype)
+                        a_exp = a_val.expand(batch_x.shape[0])
+                        output_end = self.model(output_end, batch_x, a_exp)
+                        # detach 없음: gradient가 전체 trajectory를 통해 흐름
+
+                    # End Loss: 최종 예측 vs end_idx 정답
+                    end_loss = criterion(output_end, target_end)
 
                     # loss = lambda_traj * traj_loss + lambda_end * end_loss
                     

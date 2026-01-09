@@ -1,10 +1,10 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=3
 
 ### Training description
-learning_rate=0.0001
-batch_size=64
+learning_rate=0.01
+batch_size=16
 train_epochs=100
 patience=100
 
@@ -24,36 +24,36 @@ interval=0.1
 ### Loss configuration
 use_ma_start=0
 lambda_mu=0.0
-lambda_traj=0.0
-lambda_end=1.0
+lambda_traj=1.0
+lambda_end=0.0
 
 ### Channel mode: 0=channel-mixing, 1=channel-independent
 channel_independent=1
 
 variate=M
-enc_in=7
-c_out=7
+enc_in=321
+c_out=321
 
-fig_tag="01_09_newtimemixer"
-exp_tag="second_2"
+fig_tag="01_09_timemixer"
+exp_tag=""
 
 # Array of prediction lengths to test
 pred_lengths=(96)
 
 echo "================================"
-echo "Starting ETTh2 (Multivariate) TimeMixer_MA experiments"
+echo "Starting electricity (Multivariate) TimeMixer_MA experiments"
 echo "================================"
 for pred_len in "${pred_lengths[@]}"; do
-    echo "Running ETTh2 with pred_len=$pred_len"
+    echo "Running electricity with pred_len=$pred_len"
     python -u run.py \
       --task_name test \
       --is_training 1 \
-      --root_path ./dataset/ETT-small/ \
-      --data_path ETTh2.csv \
-      --model_id ETTh2_${seq_len}_${pred_len}_${variate} \
+      --root_path ./dataset/electricity/ \
+      --data_path electricity.csv \
+      --model_id electricity_${seq_len}_${pred_len}_${variate} \
       --model $model_name \
       --train_epochs $train_epochs \
-      --data ETTh2 \
+      --data custom \
       --features $variate \
       --seq_len $seq_len \
       --label_len 0 \
@@ -80,5 +80,5 @@ for pred_len in "${pred_lengths[@]}"; do
 done
 
 echo "================================"
-echo "ETTh2 (Multivariate) TimeMixer_MA experiments completed!"
+echo "electricity (Multivariate) TimeMixer_MA experiments completed!"
 echo "================================"
